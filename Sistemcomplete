@@ -1,0 +1,4796 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Sistema biométrico unificado:
+- Registro de usuarios
+- Registro de huella R503
+- Captura y entrenamiento facial LBPH
+- Acceso por huella + rostro + contraseña
+- Ventana 1: accesos de Etapa 1
+- Ventana 2: registros de usuarios + vigilancia Etapa 2
+- Ventana 1 usa el teclado matricial 4x4 para acceso
+- Ventana 2 se opera aparte con mouse/touch o teclado normal
+- Logs, evidencias y respaldos
+
+Rutas base:
+    /home/pi/proyecto_biometrico
+"""
+
+import os
+os.environ["LIBCAMERA_LOG_LEVELS"] = "*:ERROR"
+os.environ.setdefault("DISPLAY", ":0")
+os.environ.setdefault("XAUTHORITY", "/home/pi/.Xauthority")
+
+import cv2
+import json
+import time
+import gc
+import shutil
+import select
+import serial
+import subprocess
+import sys
+import unicodedata
+import adafruit_fingerprint
+import numpy as np
+import lgpio
+from datetime import datetime
+from gpiozero import DigitalInputDevice, MotionSensor
+from threading import Event, Lock, Thread
+from picamera2 import Picamera2
+
+
+def env_int(nombre, valor_por_defecto):
+    try:
+        return int(os.environ.get(nombre, str(valor_por_defecto)))
+    except (TypeError, ValueError):
+        return valor_por_defecto
+
+
+def env_bool(nombre, valor_por_defecto=False):
+    valor = os.environ.get(nombre)
+    if valor is None:
+        return valor_por_defecto
+    return valor.strip().lower() in ("1", "true", "si", "sí", "yes", "on")
+
+
+def preparar_pantallas_para_thonny():
+    """
+    Permite ejecutar directamente desde Thonny sin usar el lanzador .sh.
+    Detecta la pantalla 800x480 como pantalla de acceso y la otra como panel.
+    """
+    try:
+        resultado = subprocess.run(
+            ["xrandr", "--query"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return
+
+    if resultado.returncode != 0:
+        return
+
+    pantallas = []
+    for linea in resultado.stdout.splitlines():
+        partes = linea.split()
+        if len(partes) < 3 or partes[1] != "connected":
+            continue
+
+        nombre = partes[0]
+        geometria = None
+        for parte in partes[2:]:
+            if "x" in parte and "+" in parte:
+                geometria = parte
+                break
+
+        if geometria is None:
+            continue
+
+        try:
+            tamano, x_pos, y_pos = geometria.split("+", 2)
+            ancho, alto = tamano.split("x", 1)
+            pantallas.append({
+                "nombre": nombre,
+                "ancho": int(ancho),
+                "alto": int(alto),
+                "x": int(x_pos),
+                "y": int(y_pos),
+            })
+        except Exception:
+            continue
+
+    if not pantallas:
+        return
+
+    acceso = None
+    for pantalla in pantallas:
+        if pantalla["ancho"] == 800 and pantalla["alto"] == 480:
+            acceso = pantalla
+            break
+
+    if acceso is None:
+        acceso = pantallas[0]
+
+    registros = None
+    for pantalla in pantallas:
+        if pantalla["nombre"] != acceso["nombre"]:
+            registros = pantalla
+            break
+
+    os.environ.setdefault("PANTALLA1_OUTPUT", acceso["nombre"])
+    os.environ.setdefault("PANTALLA1_X", str(acceso["x"]))
+    os.environ.setdefault("PANTALLA1_Y", str(acceso["y"]))
+    os.environ.setdefault("PANTALLA1_W", str(acceso["ancho"]))
+    os.environ.setdefault("PANTALLA1_H", str(acceso["alto"]))
+
+    if registros is not None:
+        os.environ.setdefault("PANTALLA2_OUTPUT", registros["nombre"])
+        os.environ.setdefault("PANTALLA2_X", str(registros["x"]))
+        os.environ.setdefault("PANTALLA2_Y", str(registros["y"]))
+
+    rotacion = os.environ.get("PANTALLA1_ROTACION", "inverted").strip().lower()
+    if rotacion in ("normal", "inverted", "left", "right"):
+        try:
+            subprocess.run(
+                ["xrandr", "--output", acceso["nombre"], "--rotate", rotacion],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except Exception:
+            pass
+
+
+preparar_pantallas_para_thonny()
+
+# ============================================================
+# RUTAS DEL PROYECTO
+# ============================================================
+
+BASE_DIR = os.environ.get("PROYECTO_BIOMETRICO_DIR", "/home/pi/proyecto_biometrico")
+
+USUARIOS_DIR = os.path.join(BASE_DIR, "usuarios")
+MODELOS_DIR = os.path.join(BASE_DIR, "modelos")
+ROSTROS_DIR = os.path.join(BASE_DIR, "rostros")
+REGISTROS_DIR = os.path.join(BASE_DIR, "registros")
+EVIDENCIAS_DIR = os.path.join(BASE_DIR, "evidencias")
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+BACKUP_DIR = os.path.join(BASE_DIR, "backup")
+
+USUARIOS_FILE = os.path.join(USUARIOS_DIR, "usuarios.json")
+CONFIG_FILE = os.path.join(USUARIOS_DIR, "config.json")
+MODELO_FILE = os.path.join(MODELOS_DIR, "modelo_lbph.xml")
+ROSTRO_IDS_FILE = os.path.join(MODELOS_DIR, "rostro_ids.json")
+LOG_FILE = os.path.join(LOGS_DIR, "accesos.log")
+CONTEO_ACCESOS_FILE = os.path.join(REGISTROS_DIR, "conteo_accesos.json")
+PERMISOS_ETAPA1_FILE = os.path.join(REGISTROS_DIR, "permisos_etapa1.json")
+
+# ============================================================
+# CONFIGURACIÓN GENERAL
+# ============================================================
+
+DEFAULT_PASSWORD_USUARIO = "12345"
+DEFAULT_PASSWORD_ADMIN = "189C275D"
+VERSION_SISTEMA = "ventana1-parpadeo-v21-password-selectiva"
+
+TARGET_FACES = 100
+FACE_SIZE = (200, 200)
+CAMERA_SIZE = (640, 480)
+CAMARA_ETAPA1_ID = 1
+VENTANA_ETAPA1 = "Ventana 1 - Etapa 1 Accesos"
+VENTANA_ETAPA2 = "VENTANA 2 - Control de accesos y monitoreo"
+VENTANA_ETAPA1_SIZE = (
+    env_int("PANTALLA1_W", 800),
+    env_int("PANTALLA1_H", 480),
+)
+VENTANA_ETAPA1_POS = (
+    env_int("PANTALLA1_X", 0),
+    env_int("PANTALLA1_Y", 0),
+)
+VENTANA_ETAPA2_POS = (
+    env_int("PANTALLA2_X", 800),
+    env_int("PANTALLA2_Y", 0),
+)
+VENTANA_ETAPA2_PANEL_ANCHO = 460
+VENTANA_ETAPA2_VIDEO_ANCHO = 760
+VENTANA_ETAPA2_VIDEO_ALTO = 560
+VENTANA_ETAPA2_ALTO = 720
+VENTANA1_FULLSCREEN = env_bool("VENTANA1_FULLSCREEN", env_bool("VENTANAS_FULLSCREEN", True))
+VENTANA2_FULLSCREEN = env_bool("VENTANA2_FULLSCREEN", env_bool("VENTANAS_FULLSCREEN", True))
+VENTANA1_INTERVALO_REFRESCO = float(os.environ.get("VENTANA1_INTERVALO_REFRESCO", "0.07"))
+etapa1_ventana_activa = Event()
+ventana2_registro_activo = Event()
+ventana1_ultimo_rostro_frame = None
+ventana1_ultimo_rostro_nombre = None
+ventana1_ultimo_rostro_estado = None
+ventana1_ultimo_rostro_confianza = None
+ventanas_configuradas = {}
+ventana2_menu_rects = []
+ventana2_click_opcion = None
+VENTANA2_SOLICITAR_ACCESO = "__ACCESO_4X4__"
+
+etapa1_preview_lock = Lock()
+etapa1_preview_detener = Event()
+etapa1_preview_hilo = None
+etapa1_preview_frame = None
+permisos_resumen_cache = {
+    "ts": 0,
+    "datos": {
+        "activos": 0,
+        "pendientes": 0,
+        "vigentes": 0,
+        "otorgados_hoy": 0,
+        "ultimo_vigente": False,
+        "vence_en": 0,
+    }
+}
+
+FACE_THRESHOLD = 80           # LBPH: menor = mejor; 80 tolera cambios normales de luz/pose
+VENTANA1_REQUIERE_PARPADEO = env_bool("VENTANA1_REQUIERE_PARPADEO", True)
+PARPADEO_MIN_CUADROS_ABIERTO = env_int("PARPADEO_MIN_CUADROS_ABIERTO", 2)
+PARPADEO_MIN_CUADROS_CERRADO = env_int("PARPADEO_MIN_CUADROS_CERRADO", 2)
+PARPADEO_MIN_OJOS_ABIERTOS = env_int("PARPADEO_MIN_OJOS_ABIERTOS", 1)
+UMBRAL_HUELLA = 80
+
+MIN_SAMPLE_INTERVAL = 0.25
+MIN_CARACTERES = 5
+MAX_CARACTERES = 8
+MAX_INTENTOS_PASSWORD = 3
+
+TIEMPO_MAX_HUELLA = 25
+TIEMPO_MAX_ROSTRO = float(os.environ.get("TIEMPO_MAX_ROSTRO", "22"))
+TIEMPO_MAX_PASSWORD = 20
+TIEMPO_BLOQUEO = 60
+
+TIEMPO_LED_RECHAZO = 2
+TIEMPO_LED_ACEPTACION = 2
+TIEMPO_PERMISO_ETAPA1 = float(os.environ.get("TIEMPO_PERMISO_ETAPA1", "14400.0"))
+MAX_HISTORIAL_ACCESOS = 1000
+MAX_HISTORIAL_PERMISOS = 1000
+
+# ============================================================
+# ETAPA 3 - RELEVADORES ACTIVO BAJO
+# ============================================================
+
+ETAPA3_USAR_RELEVADORES = env_bool("ETAPA3_USAR_RELEVADORES", True)
+ETAPA3_RELE_ACTIVO_BAJO = env_bool("ETAPA3_RELE_ACTIVO_BAJO", True)
+ETAPA3_GPIO_RELE_ACCESO = env_int("ETAPA3_GPIO_RELE_ACCESO", 16)  # pin fisico 36
+ETAPA3_GPIO_RELE_ALARMA = env_int("ETAPA3_GPIO_RELE_ALARMA", 20)  # pin fisico 38
+ETAPA3_TIEMPO_APERTURA = float(os.environ.get("ETAPA3_TIEMPO_APERTURA", "3.0"))
+ETAPA3_TIEMPO_ALARMA = float(os.environ.get("ETAPA3_TIEMPO_ALARMA", "5.0"))
+ETAPA3_ALARMA_EN_DENEGADO = env_bool("ETAPA3_ALARMA_EN_DENEGADO", False)
+
+etapa3_relevadores_iniciados = False
+etapa3_lock_acceso = Lock()
+etapa3_lock_alarma = Lock()
+
+# ============================================================
+# TECLADO MATRICIAL
+# ============================================================
+
+keys = [
+    ['1', '2', '3', 'A'],
+    ['4', '5', '6', 'B'],
+    ['7', '8', '9', 'C'],
+    ['*', '0', '#', 'D']
+]
+
+ROWS = [26, 19, 13, 6]
+COLS = [5, 22, 27, 17]
+TECLADO_DEBOUNCE_SEG = 0.035
+TECLADO_POST_TECLA_SEG = 0.18
+
+h_gpio = lgpio.gpiochip_open(0)
+
+for row in ROWS:
+    lgpio.gpio_claim_output(h_gpio, row, 1)
+
+for col in COLS:
+    lgpio.gpio_claim_input(h_gpio, col, lgpio.SET_PULL_UP)
+
+def leer_tecla():
+    """
+    Lee una tecla del teclado matricial.
+    """
+    for i, row in enumerate(ROWS):
+        for r in ROWS:
+            lgpio.gpio_write(h_gpio, r, 1)
+
+        lgpio.gpio_write(h_gpio, row, 0)
+
+        for j, col in enumerate(COLS):
+            if lgpio.gpio_read(h_gpio, col) == 0:
+                time.sleep(TECLADO_DEBOUNCE_SEG)
+                if lgpio.gpio_read(h_gpio, col) != 0:
+                    continue
+
+                tecla = keys[i][j]
+
+                while lgpio.gpio_read(h_gpio, col) == 0:
+                    time.sleep(0.01)
+
+                time.sleep(TECLADO_POST_TECLA_SEG)
+                return tecla
+
+    return None
+
+# ============================================================
+# UTILIDADES GENERALES
+# ============================================================
+
+def limpiar():
+    if os.environ.get("TERM"):
+        os.system("clear")
+
+
+def pausa():
+    try:
+        input("\nPresione ENTER para continuar...")
+    except EOFError:
+        pass
+
+
+# ============================================================
+# DISPLAY / VENTANAS DEL SISTEMA
+# ============================================================
+
+def texto_ascii(texto):
+    texto = str(texto)
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = texto.encode("ascii", "ignore").decode("ascii")
+    return texto
+
+
+def _texto(frame, texto, x, y, escala=0.7, color=(255, 255, 255), grosor=2):
+    cv2.putText(
+        frame,
+        texto_ascii(texto),
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        escala,
+        color,
+        grosor,
+        cv2.LINE_AA,
+    )
+
+
+def _tiempo_legible(segundos):
+    try:
+        segundos = max(0, int(round(float(segundos or 0))))
+    except Exception:
+        segundos = 0
+
+    horas = segundos // 3600
+    minutos = (segundos % 3600) // 60
+    seg = segundos % 60
+
+    if horas > 0:
+        return f"{horas}h {minutos:02d}m"
+    if minutos > 0:
+        return f"{minutos}m {seg:02d}s"
+    return f"{seg}s"
+
+
+def _rect(frame, x, y, w, h, fondo, borde=None, grosor=1):
+    cv2.rectangle(frame, (x, y), (x + w, y + h), fondo, -1)
+    if borde is not None:
+        cv2.rectangle(frame, (x, y), (x + w, y + h), borde, grosor)
+
+
+def _tarjeta(frame, x, y, w, h, titulo=None, valor=None, color=(255, 150, 20)):
+    _rect(frame, x, y, w, h, (44, 32, 24), (112, 82, 58), 1)
+    if h < 55 and titulo is not None and valor is not None:
+        _texto(frame, titulo, x + 14, y + h // 2 + 7, 0.43, (238, 242, 248), 1)
+        _texto(frame, valor, x + w - 58, y + h // 2 + 8, 0.56, color, 2)
+        return
+
+    if titulo is not None:
+        _texto(frame, titulo, x + 14, y + 24, 0.43, (238, 242, 248), 1)
+    if valor is not None:
+        valor_txt = str(valor)
+        escala = 0.44 if len(valor_txt) > 9 else 0.62
+        grosor = 1 if len(valor_txt) > 9 else 2
+        _texto(frame, valor_txt, x + 14, y + h - 13, escala, color, grosor)
+
+
+def _fila_menu(frame, x, y, w, numero, texto, activo=False):
+    alto_fila = 22
+    fondo = (78, 56, 42) if activo else (43, 31, 22)
+    borde = (255, 150, 20) if activo else (112, 82, 58)
+    color_num = (255, 225, 40) if activo else (195, 210, 225)
+    _rect(frame, x, y, w, alto_fila, fondo, borde, 1)
+    _rect(frame, x + 10, y + 4, 26, 14, (60, 42, 28), borde, 1)
+    _texto(frame, str(numero), x + 17, y + 17, 0.34, color_num, 1)
+    _texto(frame, texto, x + 50, y + 17, 0.38, (238, 242, 248), 1)
+    _texto(frame, ">", x + w - 22, y + 18, 0.42, (255, 150, 20), 1)
+
+
+def _chip_estado(frame, x, y, w, texto, color, fondo=(14, 30, 50)):
+    _rect(frame, x, y, w, 42, fondo, color, 1)
+    cv2.circle(frame, (x + 26, y + 21), 9, color, 1)
+    _texto(frame, texto, x + 48, y + 28, 0.46, color, 1)
+
+
+def ventana2_mouse_callback(event, x, y, flags, param):
+    global ventana2_click_opcion
+
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+
+    for opcion, x1, y1, x2, y2 in ventana2_menu_rects:
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            ventana2_click_opcion = opcion
+            return
+
+
+def _configurar_ventana(nombre, ancho, alto, posicion, pantalla_completa=False):
+    clave = (ancho, alto, posicion[0], posicion[1], bool(pantalla_completa))
+    if ventanas_configuradas.get(nombre) == clave:
+        return
+
+    flags = cv2.WINDOW_NORMAL
+    if hasattr(cv2, "WINDOW_GUI_NORMAL"):
+        flags |= cv2.WINDOW_GUI_NORMAL
+
+    cv2.namedWindow(nombre, flags)
+    cv2.resizeWindow(nombre, ancho, alto)
+    cv2.moveWindow(nombre, posicion[0], posicion[1])
+    if nombre == VENTANA_ETAPA2:
+        callback = globals().get("ventana2_mouse_callback")
+        if callable(callback):
+            cv2.setMouseCallback(nombre, callback)
+    if pantalla_completa:
+        cv2.setWindowProperty(
+            nombre,
+            cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN,
+        )
+
+    ventanas_configuradas[nombre] = clave
+
+
+def _mostrar_frame(nombre, frame, posicion):
+    try:
+        pantalla_completa = (
+            (nombre == VENTANA_ETAPA1 and VENTANA1_FULLSCREEN)
+            or (nombre == VENTANA_ETAPA2 and VENTANA2_FULLSCREEN)
+        )
+        _configurar_ventana(
+            nombre,
+            frame.shape[1],
+            frame.shape[0],
+            posicion,
+            pantalla_completa,
+        )
+        cv2.imshow(nombre, frame)
+        cv2.waitKey(1)
+    except Exception as e:
+        print(f"No se pudo mostrar {nombre}: {e}")
+
+
+def _color_estado_acceso(estado, detalle=None):
+    estado = str(estado or "").upper()
+    detalle = str(detalle or "").lower()
+
+    if estado == "AUTORIZADO":
+        return (90, 230, 90)
+    if estado == "DENEGADO":
+        return (45, 65, 240)
+    if "password" in detalle:
+        return (255, 90, 190)
+    if "rostro" in detalle or "camara" in detalle:
+        return (255, 225, 40)
+    return (255, 150, 20)
+
+
+def _paso_actual_acceso(detalle=None, estado=None):
+    texto = f"{estado or ''} {detalle or ''}".lower()
+    if "password" in texto:
+        return "password"
+    if "rostro" in texto or "camara" in texto:
+        return "rostro"
+    if "huella" in texto:
+        return "huella"
+    return "huella"
+
+
+def _dibujar_chip(frame, x, y, w, h, texto, color, activo=False):
+    fondo = (22, 31, 43)
+    if activo:
+        fondo = (30, 48, 70)
+
+    cv2.rectangle(frame, (x, y), (x + w, y + h), fondo, -1)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color if activo else (68, 78, 92), 2)
+    cv2.circle(frame, (x + 26, y + h // 2), 13, color if activo else (65, 75, 88), -1)
+    _texto(frame, texto, x + 50, y + h // 2 + 7, 0.48, (235, 240, 245), 1)
+
+
+def _ajustar_frame(frame, ancho, alto):
+    if frame is None:
+        return None
+    try:
+        return cv2.resize(frame, (ancho, alto))
+    except Exception:
+        return None
+
+
+def _color_rostro(rostro_estado=None, rostro_confianza=None):
+    estado = str(rostro_estado or "").upper()
+    if estado == "DESCONOCIDO":
+        return (45, 65, 240)
+    if estado == "BUSCANDO":
+        return (255, 170, 40)
+    if estado in ("PARPADEA", "ANTIFRAUDE"):
+        return (255, 225, 40)
+    if estado in ("VIDA OK", "VERIFICADO"):
+        return (90, 230, 90)
+
+    if rostro_confianza is not None:
+        try:
+            confianza = float(rostro_confianza)
+            if confianza < 45:
+                return (255, 45, 255)
+            if confianza < FACE_THRESHOLD:
+                return (255, 180, 35)
+        except Exception:
+            pass
+
+    if estado in ("CONOCIDO", "VERIFICADO"):
+        return (255, 45, 255)
+    return (90, 100, 115)
+
+
+def ventana1_limpiar_rostro():
+    global ventana1_ultimo_rostro_frame
+    global ventana1_ultimo_rostro_nombre
+    global ventana1_ultimo_rostro_estado
+    global ventana1_ultimo_rostro_confianza
+
+    ventana1_ultimo_rostro_frame = None
+    ventana1_ultimo_rostro_nombre = None
+    ventana1_ultimo_rostro_estado = None
+    ventana1_ultimo_rostro_confianza = None
+
+
+def ventana1_guardar_rostro(frame, nombre=None, estado=None, confianza=None):
+    global ventana1_ultimo_rostro_frame
+    global ventana1_ultimo_rostro_nombre
+    global ventana1_ultimo_rostro_estado
+    global ventana1_ultimo_rostro_confianza
+
+    ventana1_ultimo_rostro_frame = frame.copy() if frame is not None else None
+    ventana1_ultimo_rostro_nombre = nombre
+    ventana1_ultimo_rostro_estado = estado
+    ventana1_ultimo_rostro_confianza = confianza
+
+
+def _crear_lienzo_acceso(
+    titulo,
+    estado,
+    detalle=None,
+    conteo=None,
+    camara_frame=None,
+    rostro_nombre=None,
+    rostro_estado=None,
+    rostro_confianza=None,
+):
+    ancho, alto = VENTANA_ETAPA1_SIZE
+    frame = np.zeros((alto, ancho, 3), dtype=np.uint8)
+
+    for y in range(alto):
+        base = 16 + int(18 * y / max(1, alto))
+        frame[y, :] = (base + 12, base + 6, base)
+
+    azul = (255, 150, 20)
+    cian = (255, 225, 40)
+    blanco = (238, 242, 248)
+    gris = (150, 160, 174)
+    panel = (22, 30, 42)
+    borde = (58, 74, 96)
+    color_estado = _color_estado_acceso(estado, detalle)
+
+    cv2.rectangle(frame, (0, 0), (ancho, 82), (23, 31, 44), -1)
+    cv2.line(frame, (0, 82), (ancho, 82), (45, 58, 78), 2)
+    cv2.circle(frame, (54, 41), 24, azul, 2)
+    cv2.line(frame, (54, 21), (54, 61), azul, 2)
+    cv2.line(frame, (36, 38), (54, 21), azul, 2)
+    cv2.line(frame, (72, 38), (54, 21), azul, 2)
+    _texto(frame, "VENTANA 1", 95, 36, 0.65, azul, 2)
+    _texto(frame, titulo, 95, 66, 0.54, blanco, 1)
+    _texto(frame, "ACCESOS", ancho - 155, 50, 0.55, (190, 205, 220), 1)
+
+    cv2.rectangle(frame, (20, 100), (470, 244), panel, -1)
+    cv2.rectangle(frame, (20, 100), (470, 244), color_estado, 2)
+    cv2.circle(frame, (80, 172), 44, color_estado, 2)
+    cv2.rectangle(frame, (55, 147), (105, 197), (18, 24, 34), 2)
+    for i in range(4):
+        cv2.ellipse(frame, (80, 172), (10 + i * 7, 18 + i * 6), 0, 200, 520, color_estado, 2)
+
+    _texto(frame, str(estado).upper(), 150, 162, 0.9, color_estado, 3)
+    if detalle:
+        _texto(frame, str(detalle)[:28], 150, 205, 0.56, blanco, 1)
+
+    cam_x, cam_y, cam_w, cam_h = 490, 100, ancho - 510, 210
+    color_rostro = _color_rostro(rostro_estado, rostro_confianza)
+    cv2.rectangle(frame, (cam_x, cam_y), (cam_x + cam_w, cam_y + cam_h), (10, 15, 22), -1)
+    cv2.rectangle(frame, (cam_x, cam_y), (cam_x + cam_w, cam_y + cam_h), color_rostro, 2)
+
+    vista = _ajustar_frame(camara_frame, cam_w - 8, cam_h - 46)
+    if vista is not None:
+        frame[cam_y + 4:cam_y + 4 + vista.shape[0], cam_x + 4:cam_x + 4 + vista.shape[1]] = vista
+    else:
+        _texto(frame, "CAMARA", cam_x + 26, cam_y + 72, 0.6, gris, 1)
+        _texto(frame, "Reconocimiento", cam_x + 26, cam_y + 104, 0.46, gris, 1)
+        _texto(frame, "en espera", cam_x + 26, cam_y + 132, 0.46, gris, 1)
+
+    cv2.rectangle(frame, (cam_x, cam_y + cam_h - 38), (cam_x + cam_w, cam_y + cam_h), (12, 18, 28), -1)
+    nombre = rostro_nombre or "Sin usuario"
+    etiqueta = rostro_estado or "EN ESPERA"
+    _texto(frame, str(etiqueta)[:14], cam_x + 10, cam_y + cam_h - 17, 0.39, color_rostro, 1)
+    _texto(frame, str(nombre)[:18], cam_x + 116, cam_y + cam_h - 17, 0.39, blanco, 1)
+
+    cv2.rectangle(frame, (20, 326), (ancho - 20, alto - 22), (18, 24, 34), -1)
+    cv2.rectangle(frame, (20, 326), (ancho - 20, alto - 22), borde, 1)
+    _texto(frame, "Solo accesos Etapa 1", 42, 360, 0.55, blanco, 2)
+    _texto(frame, "#  Iniciar acceso biometrico", 42, 392, 0.45, (205, 215, 230), 1)
+
+    paso = _paso_actual_acceso(detalle, estado)
+    y_chip = 418
+    _dibujar_chip(frame, 42, y_chip, 162, 40, "huella", azul, paso == "huella")
+    _texto(frame, ">", 224, y_chip + 27, 0.65, gris, 2)
+    _dibujar_chip(frame, 262, y_chip, 162, 40, "rostro", cian, paso == "rostro")
+    _texto(frame, ">", 444, y_chip + 27, 0.65, gris, 2)
+    _dibujar_chip(frame, 482, y_chip, 172, 40, "password", (255, 90, 190), paso == "password")
+
+    if conteo is not None:
+        _texto(frame, f"Hoy {conteo.get('total_hoy', 0)}", ancho - 124, 360, 0.42, (160, 245, 170), 1)
+        _texto(frame, f"Total {conteo.get('total', 0)}", ancho - 124, 386, 0.42, (160, 245, 170), 1)
+
+    return frame
+
+
+def ventana1_mostrar_accesos(
+    estado="LISTO",
+    detalle=None,
+    conteo=None,
+    camara_frame=None,
+    rostro_nombre=None,
+    rostro_estado=None,
+    rostro_confianza=None,
+    usar_ultimo_rostro=False,
+):
+    if usar_ultimo_rostro and camara_frame is None:
+        camara_frame = ventana1_ultimo_rostro_frame
+        rostro_nombre = rostro_nombre or ventana1_ultimo_rostro_nombre
+        rostro_estado = rostro_estado or ventana1_ultimo_rostro_estado
+        rostro_confianza = (
+            rostro_confianza
+            if rostro_confianza is not None
+            else ventana1_ultimo_rostro_confianza
+        )
+
+    if camara_frame is None:
+        obtener_preview = globals().get("obtener_frame_vista_camara_etapa1")
+        if obtener_preview is not None:
+            camara_frame = obtener_preview(0.0)
+            if camara_frame is not None and rostro_estado is None:
+                rostro_estado = "EN VIVO"
+                rostro_nombre = rostro_nombre or "Camara activa"
+
+    frame = _crear_lienzo_acceso(
+        "Etapa 1 - Accesos",
+        estado,
+        detalle=detalle,
+        conteo=conteo,
+        camara_frame=camara_frame,
+        rostro_nombre=rostro_nombre,
+        rostro_estado=rostro_estado,
+        rostro_confianza=rostro_confianza,
+    )
+    _mostrar_frame(VENTANA_ETAPA1, frame, VENTANA_ETAPA1_POS)
+
+
+def _base_etapa2_para_display():
+    try:
+        with etapa2_lock:
+            if etapa2_frame_vista is not None:
+                return etapa2_frame_vista.copy()
+    except Exception:
+        pass
+
+    frame = np.zeros((CAMERA_SIZE[1], CAMERA_SIZE[0], 3), dtype=np.uint8)
+    frame[:] = (20, 24, 32)
+    _texto(frame, "ETAPA 2", 30, 70, 1.0, (0, 210, 255), 2)
+    _texto(frame, "Esperando video de vigilancia...", 30, 115, 0.7, (235, 235, 235), 2)
+    return frame
+
+
+def _datos_etapa2_para_display():
+    try:
+        return etapa2_obtener_estado()
+    except Exception:
+        return {
+            "entraron": 0,
+            "salieron": 0,
+            "personas_dentro": 0,
+            "entradas_no_autorizadas": 0,
+            "permisos_pendientes": 0,
+            "permisos_vigentes": 0,
+            "permisos_otorgados_hoy": 0,
+            "permiso_activo": False,
+            "permiso_vigente": False,
+            "permiso_vence_en": 0,
+            "pir_activo": False,
+            "movimiento_camara": False,
+            "ultimo_evento": "Etapa 2 iniciando",
+        }
+
+
+def _componer_ventana2(
+    frame_base,
+    encabezado="REGISTROS + ETAPA 2",
+    mensaje=None,
+    opcion_activa=None,
+):
+    global ventana2_menu_rects
+
+    alto = VENTANA_ETAPA2_ALTO
+    margen = 22
+    video_x = margen
+    video_y = 104
+    video_w = VENTANA_ETAPA2_VIDEO_ANCHO
+    video_h = VENTANA_ETAPA2_VIDEO_ALTO
+    panel_x = video_x + video_w + 22
+    panel_w = VENTANA_ETAPA2_PANEL_ANCHO
+    ancho = panel_x + panel_w + margen
+
+    lienzo = np.zeros((alto, ancho, 3), dtype=np.uint8)
+    lienzo[:] = (36, 26, 20)
+
+    # Encabezado
+    _rect(lienzo, 0, 0, ancho, 86, (44, 31, 23), (78, 58, 45), 1)
+    cv2.circle(lienzo, (60, 43), 28, (255, 150, 20), 2)
+    cv2.circle(lienzo, (60, 34), 7, (255, 150, 20), -1)
+    cv2.rectangle(lienzo, (48, 47), (72, 64), (255, 150, 20), 2)
+    _texto(lienzo, "VENTANA 2", 104, 42, 0.9, (255, 150, 20), 3)
+    _texto(lienzo, "Control de accesos y monitoreo", 305, 40, 0.56, (238, 242, 248), 1)
+    _texto(lienzo, encabezado[:28], 106, 70, 0.48, (255, 225, 40), 1)
+
+    if mensaje:
+        _texto(lienzo, str(mensaje)[:34], ancho - 365, 58, 0.46, (225, 205, 185), 1)
+
+    datos = _datos_etapa2_para_display()
+    try:
+        total_registros = len(cargar_usuarios())
+    except Exception:
+        total_registros = 0
+    permiso_vigente = bool(datos.get("permiso_vigente"))
+    permisos_activos_total = int(datos.get("permisos_vigentes", 0) or 0)
+    permiso_texto = (
+        f"Permisos autorizados: {permisos_activos_total}"
+        if permiso_vigente
+        else "Sin permisos autorizados"
+    )
+    color_permiso = (90, 230, 90) if permiso_vigente else (45, 65, 240)
+    rostro_estado = str(datos.get("rostro_estado") or "")
+    rostro_nombre = str(datos.get("rostro_nombre") or "")
+    if rostro_nombre:
+        permiso_texto = f"Rostro: {rostro_nombre[:16]} {rostro_estado[:12]}"
+        color_permiso = (45, 65, 240) if rostro_estado == "NO AUTORIZADO" else (90, 230, 90)
+    ultimo_evento = str(datos.get("ultimo_evento", ""))
+    evento_mayus = ultimo_evento.upper()
+    alerta_vigilancia = "ALERTA ETAPA 2" in evento_mayus
+    alerta_pir = alerta_vigilancia and "PIR" in evento_mayus
+    alerta_camara = alerta_vigilancia and "CAMARA" in evento_mayus
+    pir_armado = bool(datos.get("pir_activo"))
+
+    # Tarjeta de camara
+    titulo_h = 48
+    evento_h = 0
+    camara_y = video_y + titulo_h
+    camara_h = video_h - titulo_h - evento_h
+    _rect(lienzo, video_x, video_y, video_w, video_h, (34, 24, 18), (112, 82, 58), 1)
+    _rect(lienzo, video_x, video_y, video_w, titulo_h, (43, 31, 22), (112, 82, 58), 1)
+    _texto(lienzo, "Camara en vivo", video_x + 48, video_y + 31, 0.58, (238, 242, 248), 2)
+    cv2.rectangle(lienzo, (video_x + 20, video_y + 18), (video_x + 34, video_y + 30), (238, 242, 248), -1)
+    cv2.circle(lienzo, (video_x + 39, video_y + 24), 7, (238, 242, 248), -1)
+
+    vista = _ajustar_frame(frame_base, video_w - 4, camara_h)
+    if vista is not None:
+        lienzo[camara_y:camara_y + vista.shape[0], video_x + 2:video_x + 2 + vista.shape[1]] = vista
+
+    # Tarjetas superiores del panel derecho
+    card_y = video_y
+    card_w = (panel_w - 20) // 3
+    _tarjeta(lienzo, panel_x, card_y, card_w, 74, "Registros", str(total_registros), (255, 150, 20))
+    _tarjeta(lienzo, panel_x + card_w + 10, card_y, card_w, 74, "Accesos", str(datos.get("permisos_otorgados_hoy", 0)), (255, 225, 40))
+    if rostro_estado == "NO AUTORIZADO":
+        estado_monitor = "ROSTRO NO AUT."
+        color_estado_monitor = (45, 65, 240)
+    elif rostro_estado == "AUTORIZADO":
+        estado_monitor = "ROSTRO OK"
+        color_estado_monitor = (90, 230, 90)
+    elif alerta_pir and alerta_camara:
+        estado_monitor = "ALERTA PIR/CAM"
+        color_estado_monitor = (45, 65, 240)
+    elif alerta_pir:
+        estado_monitor = "ALERTA PIR"
+        color_estado_monitor = (45, 65, 240)
+    elif alerta_camara:
+        estado_monitor = "ALERTA CAMARA"
+        color_estado_monitor = (45, 65, 240)
+    elif pir_armado:
+        estado_monitor = "Vigilancia armada"
+        color_estado_monitor = (255, 225, 40)
+    elif datos.get("movimiento_camara"):
+        estado_monitor = "Movimiento"
+        color_estado_monitor = (255, 170, 40)
+    else:
+        estado_monitor = "En monitoreo"
+        color_estado_monitor = (90, 230, 90)
+    _tarjeta(lienzo, panel_x + (card_w + 10) * 2, card_y, card_w, 74, "Estado", estado_monitor, color_estado_monitor)
+
+    # Menu de registros
+    menu_y = card_y + 90
+    menu_h = 292
+    _rect(lienzo, panel_x, menu_y, panel_w, menu_h, (34, 24, 18), (112, 82, 58), 1)
+    _texto(lienzo, "MENU REGISTROS", panel_x + 16, menu_y + 30, 0.53, (238, 242, 248), 2)
+    opciones = [
+        "Registrar usuario",
+        "Ver usuarios",
+        "Activar / Desactivar",
+        "Eliminar usuario",
+        "Cambiar passwords",
+        "Reentrenar LBPH",
+        "Probar rostro",
+        "Crear respaldo",
+        "Borrar datos temporales",
+        "Ver conteo",
+    ]
+
+    y = menu_y + 45
+    ventana2_menu_rects = []
+    for numero, opcion in enumerate(opciones, start=1):
+        opcion_id = 10 if numero == 10 else numero
+        _fila_menu(
+            lienzo,
+            panel_x + 16,
+            y,
+            panel_w - 32,
+            "0" if numero == 10 else numero,
+            opcion,
+            activo=(opcion_activa == opcion_id),
+        )
+        ventana2_menu_rects.append((opcion_id, panel_x + 16, y, panel_x + panel_w - 16, y + 22))
+        y += 22
+
+    # Panel Etapa 2
+    etapa_y = menu_y + menu_h + 12
+    etapa_h = alto - etapa_y - 22
+    _rect(lienzo, panel_x, etapa_y, panel_w, etapa_h, (34, 24, 18), (112, 82, 58), 1)
+    _texto(lienzo, "ETAPA 2", panel_x + 16, etapa_y + 30, 0.6, (255, 150, 20), 2)
+
+    met_y = etapa_y + 44
+    met_w = (panel_w - 46) // 4
+    metricas = [
+        ("Dentro", datos["personas_dentro"], (255, 225, 40)),
+        ("Entraron", datos["entraron"], (90, 230, 90)),
+        ("Salieron", datos["salieron"], (255, 170, 40)),
+        ("No aut.", datos["entradas_no_autorizadas"], (45, 65, 240)),
+    ]
+    for i, (titulo, valor, color) in enumerate(metricas):
+        _tarjeta(lienzo, panel_x + 14 + i * (met_w + 6), met_y, met_w, 62, titulo, str(valor), color)
+
+    permiso_y = met_y + 74
+    _rect(lienzo, panel_x + 14, permiso_y, panel_w - 28, 38, (43, 31, 22), color_permiso, 1)
+    _texto(lienzo, permiso_texto[:40], panel_x + 32, permiso_y + 25, 0.45, color_permiso, 1)
+
+    resumen_y = permiso_y + 48
+    mitad = (panel_w - 36) // 2
+    _tarjeta(lienzo, panel_x + 14, resumen_y, mitad, 42, "Autorizados", str(datos.get("permisos_vigentes", 0)), (90, 230, 90))
+    _tarjeta(lienzo, panel_x + 22 + mitad, resumen_y, mitad, 42, "Hoy", str(datos.get("permisos_otorgados_hoy", 0)), (255, 170, 40))
+
+    return lienzo
+
+
+def ventana2_mostrar_registros_etapa2(mensaje=None):
+    if not globals().get("ETAPA2_MOSTRAR_VENTANA", True):
+        return
+
+    frame = _base_etapa2_para_display()
+    lienzo = _componer_ventana2(frame, mensaje=mensaje)
+    _mostrar_frame(VENTANA_ETAPA2, lienzo, VENTANA_ETAPA2_POS)
+
+
+def cargar_json(ruta, valor_por_defecto):
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        if isinstance(valor_por_defecto, dict):
+            return valor_por_defecto.copy()
+        if isinstance(valor_por_defecto, list):
+            return valor_por_defecto.copy()
+        return valor_por_defecto
+
+
+def guardar_json(ruta, datos):
+    os.makedirs(os.path.dirname(ruta), exist_ok=True)
+    with open(ruta, "w", encoding="utf-8") as f:
+        json.dump(datos, f, indent=4, ensure_ascii=False)
+
+
+def _detalle_json(detalle):
+    if detalle is None:
+        return {}
+
+    try:
+        json.dumps(detalle)
+        return detalle
+    except TypeError:
+        return {"valor": str(detalle)}
+
+
+def cargar_permisos_etapa1():
+    datos = cargar_json(PERMISOS_ETAPA1_FILE, {})
+
+    if not isinstance(datos, dict):
+        datos = {}
+
+    datos.setdefault("pendientes", [])
+    datos.setdefault("historial", [])
+    datos.setdefault("ultimo_permiso", None)
+    datos.setdefault("permiso_visual", None)
+    datos.setdefault("autorizaciones", {})
+    datos.setdefault("por_fecha", {})
+
+    return datos
+
+
+def guardar_permisos_etapa1(datos):
+    guardar_json(PERMISOS_ETAPA1_FILE, datos)
+
+
+def limpiar_permisos_vencidos(datos=None):
+    if datos is None:
+        datos = cargar_permisos_etapa1()
+
+    ahora = time.time()
+    pendientes = []
+    historial = datos.get("historial", [])
+
+    for permiso in datos.get("pendientes", []):
+        if float(permiso.get("vence_epoch", 0)) >= ahora:
+            pendientes.append(permiso)
+        else:
+            permiso = permiso.copy()
+            permiso["estado"] = "vencido"
+            permiso["vencido_en"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            historial.append(permiso)
+
+    datos["pendientes"] = pendientes
+    datos["historial"] = historial[-MAX_HISTORIAL_PERMISOS:]
+
+    permiso_visual = datos.get("permiso_visual")
+    if isinstance(permiso_visual, dict):
+        permiso_visual = permiso_visual.copy()
+        if float(permiso_visual.get("vence_epoch", 0) or 0) < ahora:
+            permiso_visual["activo"] = False
+            permiso_visual["estado"] = "vencido"
+        datos["permiso_visual"] = permiso_visual
+
+    autorizaciones = {}
+    for usuario, autorizacion in (datos.get("autorizaciones") or {}).items():
+        if not isinstance(autorizacion, dict):
+            continue
+        if float(autorizacion.get("vence_epoch", 0) or 0) >= ahora:
+            autorizaciones[normalizar_nombre(usuario)] = autorizacion
+    datos["autorizaciones"] = autorizaciones
+
+    return datos
+
+
+def usuario_tiene_autorizacion_vigente(nombre_usuario, datos=None):
+    if not nombre_usuario:
+        return False
+
+    if datos is None:
+        datos = limpiar_permisos_vencidos(cargar_permisos_etapa1())
+
+    nombre_usuario = normalizar_nombre(nombre_usuario)
+    autorizacion = (datos.get("autorizaciones") or {}).get(nombre_usuario)
+    if not isinstance(autorizacion, dict):
+        return False
+
+    return float(autorizacion.get("vence_epoch", 0) or 0) >= time.time()
+
+
+def contar_accesos_vigentes_desde_historial():
+    ahora = time.time()
+    total = 0
+    usuarios = set()
+
+    try:
+        conteo = cargar_conteo_accesos()
+    except Exception:
+        return 0, []
+
+    for acceso in conteo.get("historial", []):
+        try:
+            fecha_hora = datetime.strptime(
+                str(acceso.get("fecha_hora", "")),
+                "%Y-%m-%d %H:%M:%S",
+            )
+        except Exception:
+            continue
+
+        if ahora - fecha_hora.timestamp() > TIEMPO_PERMISO_ETAPA1:
+            continue
+
+        total += int(acceso.get("cantidad", 1) or 1)
+        usuario = acceso.get("usuario")
+        if usuario:
+            usuarios.add(normalizar_nombre(usuario))
+
+    return total, sorted(usuarios)
+
+
+def usuario_tiene_acceso_vigente_en_historial(nombre_usuario):
+    if not nombre_usuario:
+        return False
+
+    nombre_usuario = normalizar_nombre(nombre_usuario)
+    ahora = time.time()
+
+    try:
+        conteo = cargar_conteo_accesos()
+    except Exception:
+        return False
+
+    for acceso in reversed(conteo.get("historial", [])):
+        usuario = acceso.get("usuario")
+        if normalizar_nombre(usuario or "") != nombre_usuario:
+            continue
+
+        try:
+            fecha_hora = datetime.strptime(
+                str(acceso.get("fecha_hora", "")),
+                "%Y-%m-%d %H:%M:%S",
+            )
+        except Exception:
+            continue
+
+        if ahora - fecha_hora.timestamp() <= TIEMPO_PERMISO_ETAPA1:
+            return True
+
+    return False
+
+
+def asegurar_archivos_etapa1():
+    os.makedirs(REGISTROS_DIR, exist_ok=True)
+    guardar_json(CONTEO_ACCESOS_FILE, cargar_conteo_accesos())
+    guardar_permisos_etapa1(limpiar_permisos_vencidos(cargar_permisos_etapa1()))
+
+
+def hay_permiso_etapa1_activo():
+    datos = limpiar_permisos_vencidos()
+    guardar_permisos_etapa1(datos)
+    return len(datos.get("pendientes", [])) > 0
+
+
+def obtener_resumen_permisos_etapa1(cache_segundos=0.5):
+    ahora = time.time()
+    if ahora - permisos_resumen_cache["ts"] < cache_segundos:
+        return permisos_resumen_cache["datos"].copy()
+
+    datos = limpiar_permisos_vencidos(cargar_permisos_etapa1())
+    guardar_permisos_etapa1(datos)
+
+    pendientes = datos.get("pendientes", [])
+    ultimo = datos.get("ultimo_permiso") or {}
+    permiso_visual = datos.get("permiso_visual") or {}
+    autorizaciones = datos.get("autorizaciones") or {}
+
+    ultimo_vence = float(ultimo.get("vence_epoch", 0) or 0)
+    ultimo_vigente = ultimo_vence >= ahora
+
+    visual_vence = float(permiso_visual.get("vence_epoch", 0) or 0)
+    visual_vigente = (
+        bool(permiso_visual.get("activo"))
+        and visual_vence >= ahora
+    )
+
+    usuarios_activos = []
+    permisos_vigentes_total = 0
+    for usuario, autorizacion in autorizaciones.items():
+        if not isinstance(autorizacion, dict):
+            continue
+        vence_usuario = float(autorizacion.get("vence_epoch", 0) or 0)
+        if vence_usuario >= ahora:
+            usuario_norm = normalizar_nombre(usuario)
+            usuarios_activos.append(usuario_norm)
+            permisos_vigentes_total += max(1, int(autorizacion.get("accesos", 1) or 1))
+
+    usuarios_activos = sorted(set(usuarios_activos))
+    usuarios_activos_total = len(usuarios_activos)
+    vencimientos = []
+    for usuario in usuarios_activos:
+        autorizacion = autorizaciones.get(usuario) or {}
+        vence_usuario = float(autorizacion.get("vence_epoch", 0) or 0)
+        if vence_usuario >= ahora:
+            vencimientos.append(vence_usuario)
+
+    vence_en = (
+        max(0, int(round(max(vencimientos) - ahora)))
+        if vencimientos
+        else 0
+    )
+
+    fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+    otorgados_hoy = int(datos.get("por_fecha", {}).get(fecha_hoy, 0) or 0)
+
+    try:
+        conteo_accesos = cargar_conteo_accesos()
+        accesos_hoy = int(conteo_accesos.get("por_fecha", {}).get(fecha_hoy, 0) or 0)
+        otorgados_hoy = max(otorgados_hoy, accesos_hoy)
+    except Exception:
+        pass
+
+    if otorgados_hoy <= 0:
+        permisos_contados = set()
+        permisos_revisar = list(pendientes) + list(datos.get("historial", []))
+        if ultimo:
+            permisos_revisar.append(ultimo)
+
+        for permiso in permisos_revisar:
+            permiso_id = permiso.get("id")
+            if not permiso_id:
+                permiso_id = (
+                    str(permiso.get("creado_en", "")),
+                    str(permiso.get("usuario", "")),
+                    str(permiso.get("metodo", "")),
+                )
+            if permiso_id in permisos_contados:
+                continue
+            permisos_contados.add(permiso_id)
+
+            creado = str(permiso.get("creado_en", ""))
+            if creado.startswith(fecha_hoy):
+                otorgados_hoy += int(permiso.get("cantidad", 1) or 1)
+
+    permiso_vigente = permisos_vigentes_total > 0
+    vigentes = permisos_vigentes_total
+
+    resumen = {
+        "activos": vigentes,
+        "pendientes": len(pendientes),
+        "vigentes": vigentes,
+        "otorgados_hoy": otorgados_hoy,
+        "ultimo_vigente": permiso_vigente,
+        "vence_en": vence_en,
+        "usuarios_activos": usuarios_activos,
+        "ultimo_usuario": permiso_visual.get("usuario") or ultimo.get("usuario"),
+        "ultimo_estado": "vigente" if visual_vigente else ultimo.get("estado", "pendiente"),
+    }
+
+    permisos_resumen_cache["ts"] = ahora
+    permisos_resumen_cache["datos"] = resumen
+    return resumen.copy()
+
+
+def registrar_permiso_etapa1(
+    cantidad=1,
+    metodo="etapa1",
+    usuario=None,
+    detalle=None,
+    contar_acceso=True
+):
+    cantidad = max(1, int(cantidad))
+    detalle = _detalle_json(detalle)
+    ahora_dt = datetime.now()
+    ahora = ahora_dt.strftime("%Y-%m-%d %H:%M:%S")
+    fecha = ahora_dt.strftime("%Y-%m-%d")
+    vence_epoch = time.time() + TIEMPO_PERMISO_ETAPA1
+    vence_texto = datetime.fromtimestamp(vence_epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+    acceso = {
+        "fecha_hora": ahora,
+        "fecha": fecha,
+        "cantidad": cantidad,
+        "metodo": metodo,
+        "usuario": usuario,
+        "detalle": detalle
+    }
+
+    if contar_acceso:
+        conteo = cargar_conteo_accesos()
+        conteo["total"] = int(conteo.get("total", 0)) + cantidad
+        conteo.setdefault("por_fecha", {})
+        conteo.setdefault("por_usuario", {})
+        conteo.setdefault("por_metodo", {})
+        conteo.setdefault("historial", [])
+
+        conteo["por_fecha"][fecha] = int(conteo["por_fecha"].get(fecha, 0)) + cantidad
+        conteo["por_metodo"][metodo] = int(conteo["por_metodo"].get(metodo, 0)) + cantidad
+
+        usuario_clave = usuario or "sin_usuario"
+        conteo["por_usuario"][usuario_clave] = (
+            int(conteo["por_usuario"].get(usuario_clave, 0)) + cantidad
+        )
+
+        acceso["total"] = conteo["total"]
+        acceso["total_hoy"] = conteo["por_fecha"][fecha]
+        acceso["total_usuario"] = conteo["por_usuario"][usuario_clave]
+        conteo["ultimo_acceso"] = acceso
+        conteo["historial"].append(acceso)
+        conteo["historial"] = conteo["historial"][-MAX_HISTORIAL_ACCESOS:]
+        guardar_json(CONTEO_ACCESOS_FILE, conteo)
+
+    permisos = limpiar_permisos_vencidos()
+    permisos.setdefault("por_fecha", {})
+    permisos.setdefault("autorizaciones", {})
+    permisos["por_fecha"][fecha] = int(permisos["por_fecha"].get(fecha, 0)) + cantidad
+    usuario_clave = normalizar_nombre(usuario or "SIN_USUARIO")
+
+    permiso_visual = {
+        "activo": True,
+        "estado": "vigente",
+        "creado_en": ahora,
+        "vence_en": vence_texto,
+        "vence_epoch": vence_epoch,
+        "metodo": metodo,
+        "usuario": usuario,
+        "cantidad": cantidad,
+        "detalle": detalle,
+    }
+
+    autorizacion_anterior = permisos["autorizaciones"].get(usuario_clave, {})
+    permisos["autorizaciones"][usuario_clave] = {
+        "usuario": usuario_clave,
+        "estado": "vigente",
+        "creado_en": autorizacion_anterior.get("creado_en", ahora),
+        "actualizado_en": ahora,
+        "vence_en": vence_texto,
+        "vence_epoch": vence_epoch,
+        "metodo": metodo,
+        "accesos": int(autorizacion_anterior.get("accesos", 0) or 0) + cantidad,
+        "detalle": detalle,
+    }
+
+    for indice in range(cantidad):
+        permiso = {
+            "id": f"{time.time_ns()}_{indice}",
+            "creado_en": ahora,
+            "vence_en": vence_texto,
+            "vence_epoch": vence_epoch,
+            "metodo": metodo,
+            "usuario": usuario_clave,
+            "detalle": detalle,
+            "estado": "pendiente"
+        }
+        permisos["pendientes"].append(permiso)
+        permisos["ultimo_permiso"] = permiso
+
+    permisos["permiso_visual"] = permiso_visual
+    guardar_permisos_etapa1(permisos)
+    permisos_resumen_cache["ts"] = 0
+
+    actualizar_visible = globals().get("etapa2_actualizar_permiso_visible")
+    if callable(actualizar_visible):
+        actualizar_visible(
+            vence_epoch=vence_epoch,
+            usuario=usuario,
+            cantidad=cantidad,
+            sumar_hoy=True,
+        )
+
+    return permisos["ultimo_permiso"]
+
+
+def consumir_permiso_etapa1():
+    permisos = limpiar_permisos_vencidos()
+    pendientes = permisos.get("pendientes", [])
+
+    if not pendientes:
+        guardar_permisos_etapa1(permisos)
+        return None
+
+    permiso = pendientes.pop(0)
+    permiso = permiso.copy()
+    permiso["estado"] = "consumido"
+    permiso["consumido_en"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    permisos["pendientes"] = pendientes
+    if (permisos.get("ultimo_permiso") or {}).get("id") == permiso.get("id"):
+        permisos["ultimo_permiso"] = permiso
+    permisos["historial"].append(permiso)
+    permisos["historial"] = permisos["historial"][-MAX_HISTORIAL_PERMISOS:]
+    guardar_permisos_etapa1(permisos)
+    permisos_resumen_cache["ts"] = 0
+
+    actualizar_visible = globals().get("etapa2_actualizar_permiso_visible")
+    if callable(actualizar_visible):
+        actualizar_visible(
+            vence_epoch=float(permiso.get("vence_epoch", 0) or 0),
+            usuario=permiso.get("usuario"),
+            cantidad=int(permiso.get("cantidad", 1) or 1),
+            sumar_hoy=False,
+        )
+
+    return permiso
+
+
+def descontar_autorizacion_por_salida(nombre_usuario=None):
+    permisos = limpiar_permisos_vencidos(cargar_permisos_etapa1())
+    autorizaciones = permisos.setdefault("autorizaciones", {})
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    objetivo = normalizar_nombre(nombre_usuario) if nombre_usuario else None
+
+    def autorizacion_activa(autorizacion):
+        if not isinstance(autorizacion, dict):
+            return False
+        if int(autorizacion.get("accesos", 0) or 0) <= 0:
+            return False
+        return float(autorizacion.get("vence_epoch", 0) or 0) >= time.time()
+
+    if objetivo not in autorizaciones or not autorizacion_activa(autorizaciones.get(objetivo)):
+        objetivo = None
+        candidatos = []
+        for usuario, autorizacion in autorizaciones.items():
+            if not autorizacion_activa(autorizacion):
+                continue
+            marca = str(
+                autorizacion.get("creado_en")
+                or autorizacion.get("actualizado_en")
+                or ""
+            )
+            candidatos.append((marca, usuario))
+
+        if candidatos:
+            candidatos.sort()
+            objetivo = candidatos[0][1]
+
+    if not objetivo:
+        guardar_permisos_etapa1(permisos)
+        permisos_resumen_cache["ts"] = 0
+        registrar_evento("SALIDA SIN AUTORIZACION ACTIVA PARA DESCONTAR")
+        return None
+
+    autorizacion = dict(autorizaciones.get(objetivo) or {})
+    accesos_restantes = max(0, int(autorizacion.get("accesos", 0) or 0) - 1)
+
+    if accesos_restantes <= 0:
+        autorizaciones.pop(objetivo, None)
+    else:
+        autorizacion["accesos"] = accesos_restantes
+        autorizacion["actualizado_en"] = ahora
+        autorizacion["ultima_salida_en"] = ahora
+        autorizaciones[objetivo] = autorizacion
+
+    permisos["autorizaciones"] = autorizaciones
+
+    if not autorizaciones:
+        permiso_visual = permisos.get("permiso_visual")
+        if isinstance(permiso_visual, dict):
+            permiso_visual = permiso_visual.copy()
+            permiso_visual["activo"] = False
+            permiso_visual["estado"] = "sin_personas_dentro"
+            permiso_visual["salida_en"] = ahora
+            permisos["permiso_visual"] = permiso_visual
+
+    guardar_permisos_etapa1(permisos)
+    permisos_resumen_cache["ts"] = 0
+    registrar_evento(f"AUTORIZACION DESCONTADA POR SALIDA: {objetivo}")
+    return objetivo
+
+
+def normalizar_nombre(nombre):
+    nombre = " ".join(str(nombre).strip().split()).upper()
+    nombre = nombre.replace("/", "_").replace("\\", "_")
+    return nombre
+
+
+def registrar_evento(evento):
+    marca = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    linea = f"{marca} - {evento}"
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(linea + "\n")
+    except Exception as e:
+        print(f"[ERROR] No se pudo escribir log: {e}")
+
+    print(linea)
+
+
+def registrar_evento_silencioso(evento):
+    marca = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    linea = f"{marca} - {evento}"
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(linea + "\n")
+    except Exception:
+        pass
+
+
+def etapa3_valor_gpio(activo):
+    if ETAPA3_RELE_ACTIVO_BAJO:
+        return 0 if activo else 1
+    return 1 if activo else 0
+
+
+def etapa3_escribir(gpio, activo):
+    lgpio.gpio_write(h_gpio, gpio, etapa3_valor_gpio(activo))
+
+
+def etapa3_iniciar_relevadores():
+    global etapa3_relevadores_iniciados
+
+    if not ETAPA3_USAR_RELEVADORES or etapa3_relevadores_iniciados:
+        return
+
+    valor_apagado = etapa3_valor_gpio(False)
+    for gpio in (ETAPA3_GPIO_RELE_ACCESO, ETAPA3_GPIO_RELE_ALARMA):
+        try:
+            lgpio.gpio_claim_output(h_gpio, gpio, valor_apagado)
+        except Exception as e:
+            registrar_evento(f"ETAPA 3 ERROR CONFIGURANDO GPIO{gpio}: {e}")
+            try:
+                lgpio.gpio_write(h_gpio, gpio, valor_apagado)
+            except Exception:
+                pass
+
+    etapa3_relevadores_iniciados = True
+    registrar_evento(
+        "ETAPA 3 RELEVADORES LISTOS "
+        f"ACCESO=GPIO{ETAPA3_GPIO_RELE_ACCESO} "
+        f"ALARMA=GPIO{ETAPA3_GPIO_RELE_ALARMA} "
+        f"ACTIVO_BAJO={ETAPA3_RELE_ACTIVO_BAJO}"
+    )
+
+
+def etapa3_apagar_relevadores():
+    if not ETAPA3_USAR_RELEVADORES:
+        return
+
+    for gpio in (ETAPA3_GPIO_RELE_ACCESO, ETAPA3_GPIO_RELE_ALARMA):
+        try:
+            etapa3_escribir(gpio, False)
+        except Exception:
+            pass
+
+
+def etapa3_pulso(gpio, segundos, nombre, lock):
+    if not ETAPA3_USAR_RELEVADORES:
+        return
+
+    etapa3_iniciar_relevadores()
+
+    if not lock.acquire(blocking=False):
+        registrar_evento_silencioso(f"ETAPA 3 {nombre} YA ESTABA ACTIVO")
+        return
+
+    try:
+        registrar_evento(f"ETAPA 3 {nombre} ON {segundos:.1f}s")
+        etapa3_escribir(gpio, True)
+        time.sleep(segundos)
+    except Exception as e:
+        registrar_evento(f"ETAPA 3 ERROR EN {nombre}: {e}")
+    finally:
+        try:
+            etapa3_escribir(gpio, False)
+            registrar_evento_silencioso(f"ETAPA 3 {nombre} OFF")
+        except Exception:
+            pass
+        lock.release()
+
+
+def etapa3_abrir_puerta(origen="etapa1"):
+    registrar_evento(f"ETAPA 3 APERTURA SOLICITADA POR {origen}")
+    etapa3_pulso(
+        ETAPA3_GPIO_RELE_ACCESO,
+        ETAPA3_TIEMPO_APERTURA,
+        "RELE 1 ACCESO",
+        etapa3_lock_acceso,
+    )
+
+
+def etapa3_activar_alarma(origen="etapa2"):
+    def ejecutar():
+        registrar_evento(f"ETAPA 3 ALARMA SOLICITADA POR {origen}")
+        etapa3_pulso(
+            ETAPA3_GPIO_RELE_ALARMA,
+            ETAPA3_TIEMPO_ALARMA,
+            "RELE 2 ALARMA",
+            etapa3_lock_alarma,
+        )
+
+    Thread(target=ejecutar, name="Etapa3Alarma", daemon=True).start()
+
+
+def asegurar_estructura():
+    os.makedirs(USUARIOS_DIR, exist_ok=True)
+    os.makedirs(MODELOS_DIR, exist_ok=True)
+    os.makedirs(ROSTROS_DIR, exist_ok=True)
+    os.makedirs(REGISTROS_DIR, exist_ok=True)
+    os.makedirs(EVIDENCIAS_DIR, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    asegurar_archivos_etapa1()
+
+    if not os.path.exists(USUARIOS_FILE):
+        guardar_json(USUARIOS_FILE, {})
+
+    if not os.path.exists(CONFIG_FILE):
+        guardar_json(CONFIG_FILE, {
+            "password_usuario": DEFAULT_PASSWORD_USUARIO,
+            "password_admin": DEFAULT_PASSWORD_ADMIN
+        })
+
+    if not os.path.exists(ROSTRO_IDS_FILE):
+        guardar_json(ROSTRO_IDS_FILE, {})
+
+    if not os.path.exists(CONTEO_ACCESOS_FILE):
+        guardar_json(CONTEO_ACCESOS_FILE, {
+            "total": 0,
+            "por_fecha": {},
+            "por_usuario": {},
+            "ultimo_acceso": None
+        })
+
+    # Asegurar claves en config
+    config = cargar_json(CONFIG_FILE, {})
+    changed = False
+    if "password_usuario" not in config:
+        config["password_usuario"] = DEFAULT_PASSWORD_USUARIO
+        changed = True
+    if "password_admin" not in config:
+        config["password_admin"] = DEFAULT_PASSWORD_ADMIN
+        changed = True
+    if changed:
+        guardar_json(CONFIG_FILE, config)
+
+# ============================================================
+# USUARIOS
+# ============================================================
+
+def cargar_usuarios():
+    return cargar_json(USUARIOS_FILE, {})
+
+
+def guardar_usuarios(usuarios):
+    guardar_json(USUARIOS_FILE, usuarios)
+
+
+def cargar_configuracion():
+    return cargar_json(CONFIG_FILE, {
+        "password_usuario": DEFAULT_PASSWORD_USUARIO,
+        "password_admin": DEFAULT_PASSWORD_ADMIN
+    })
+
+
+def guardar_configuracion(config):
+    guardar_json(CONFIG_FILE, config)
+
+
+def listar_usuarios(usuarios):
+    if not usuarios:
+        print("\nNo hay usuarios registrados.")
+        return []
+
+    nombres = sorted(usuarios.keys())
+
+    print("\n================================")
+    print(" USUARIOS REGISTRADOS ")
+    print("================================")
+    for i, nombre in enumerate(nombres, start=1):
+        datos = usuarios[nombre]
+        estado = "ACTIVO" if datos.get("activo", True) else "INACTIVO"
+        huella = datos.get("huella_id", None)
+        rostro = datos.get("rostro_id", None)
+        tipo = datos.get("tipo", "usuario").upper()
+        print(f"{i}. {nombre} | {tipo} | {estado} | huella: {huella} | rostro: {rostro}")
+
+    return nombres
+
+
+def seleccionar_usuario(usuarios, titulo="Seleccione un usuario (número o nombre): "):
+    nombres = listar_usuarios(usuarios)
+    if not nombres:
+        return None
+
+    valor = input(f"\n{titulo}").strip()
+    if not valor:
+        return None
+
+    if valor.isdigit():
+        idx = int(valor)
+        if 1 <= idx <= len(nombres):
+            return nombres[idx - 1]
+
+    valor_norm = normalizar_nombre(valor)
+    for nombre in nombres:
+        if normalizar_nombre(nombre) == valor_norm:
+            return nombre
+
+    return None
+
+
+def obtener_usuario_por_huella_id(usuarios, huella_id):
+    try:
+        huella_buscada = int(huella_id)
+    except Exception:
+        return None, None
+
+    for nombre, datos in usuarios.items():
+        huella_usuario = datos.get("huella_id", None)
+        if huella_usuario in (None, ""):
+            continue
+
+        try:
+            if int(huella_usuario) == huella_buscada:
+                return nombre, datos
+        except Exception:
+            continue
+
+    return None, None
+
+
+def obtener_usuario_por_rostro_id(usuarios, rostro_id, mapa_rostros):
+    nombre_mapa = mapa_rostros.get(str(rostro_id), None)
+    if nombre_mapa is None:
+        return None, None
+
+    nombre_norm = normalizar_nombre(nombre_mapa)
+    for nombre, datos in usuarios.items():
+        if normalizar_nombre(nombre) == nombre_norm:
+            return nombre, datos
+    return None, None
+
+# ============================================================
+# RESPALDOS
+# ============================================================
+
+def crear_respaldo():
+    fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
+    carpeta_backup = os.path.join(BACKUP_DIR, fecha)
+    os.makedirs(carpeta_backup, exist_ok=True)
+
+    archivos = [
+        USUARIOS_FILE,
+        CONFIG_FILE,
+        ROSTRO_IDS_FILE,
+        MODELO_FILE,
+        CONTEO_ACCESOS_FILE
+    ]
+
+    for archivo in archivos:
+        if os.path.exists(archivo):
+            try:
+                shutil.copy2(archivo, carpeta_backup)
+            except Exception as e:
+                registrar_evento(f"ERROR RESPALDANDO {archivo}: {e}")
+
+    if os.path.exists(ROSTROS_DIR):
+        destino_rostros = os.path.join(carpeta_backup, "rostros")
+        try:
+            shutil.copytree(ROSTROS_DIR, destino_rostros, dirs_exist_ok=True)
+        except Exception as e:
+            registrar_evento(f"ERROR RESPALDANDO CARPETA DE ROSTROS: {e}")
+
+    if os.path.exists(EVIDENCIAS_DIR):
+        destino_evidencias = os.path.join(carpeta_backup, "evidencias")
+        try:
+            shutil.copytree(EVIDENCIAS_DIR, destino_evidencias, dirs_exist_ok=True)
+        except Exception as e:
+            registrar_evento(f"ERROR RESPALDANDO EVIDENCIAS: {e}")
+
+    print("\n================================")
+    print(" RESPALDO CREADO ")
+    print("================================")
+    print(carpeta_backup)
+    registrar_evento(f"RESPALDO CREADO -> {carpeta_backup}")
+
+
+# ============================================================
+# CONTEO DE ACCESOS
+# ============================================================
+
+def cargar_conteo_accesos():
+    datos = cargar_json(CONTEO_ACCESOS_FILE, {})
+
+    if not isinstance(datos, dict):
+        datos = {}
+
+    datos.setdefault("total", 0)
+    datos.setdefault("por_fecha", {})
+    datos.setdefault("por_usuario", {})
+    datos.setdefault("por_metodo", {})
+    datos.setdefault("historial", [])
+    datos.setdefault("ultimo_acceso", None)
+
+    return datos
+
+
+def registrar_entrada(nombre_usuario):
+    conteo = cargar_conteo_accesos()
+
+    ahora = datetime.now()
+    fecha = ahora.strftime("%Y-%m-%d")
+    marca = ahora.strftime("%Y-%m-%d %H:%M:%S")
+    nombre_usuario = normalizar_nombre(nombre_usuario)
+
+    conteo["total"] = int(conteo.get("total", 0)) + 1
+
+    por_fecha = conteo.setdefault("por_fecha", {})
+    por_fecha[fecha] = int(por_fecha.get(fecha, 0)) + 1
+
+    por_usuario = conteo.setdefault("por_usuario", {})
+    por_usuario[nombre_usuario] = int(por_usuario.get(nombre_usuario, 0)) + 1
+
+    por_metodo = conteo.setdefault("por_metodo", {})
+    por_metodo["biometria"] = int(por_metodo.get("biometria", 0)) + 1
+
+    conteo["ultimo_acceso"] = {
+        "fecha_hora": marca,
+        "fecha": fecha,
+        "usuario": nombre_usuario,
+        "metodo": "biometria",
+        "cantidad": 1,
+        "total": conteo["total"],
+        "total_hoy": por_fecha[fecha],
+        "total_usuario": por_usuario[nombre_usuario],
+    }
+
+    historial = conteo.setdefault("historial", [])
+    historial.append(conteo["ultimo_acceso"])
+    conteo["historial"] = historial[-1000:]
+
+    guardar_json(CONTEO_ACCESOS_FILE, conteo)
+    registrar_permiso_etapa1(
+        metodo="biometria",
+        usuario=nombre_usuario,
+        detalle={"conteo": conteo["ultimo_acceso"]},
+        contar_acceso=False
+    )
+    registrar_evento(
+        f"CONTEO ENTRADAS TOTAL={conteo['total']} HOY={por_fecha[fecha]} "
+        f"USUARIO={nombre_usuario} USUARIO_TOTAL={por_usuario[nombre_usuario]} "
+        "PERMISO_ETAPA2=ACTIVO"
+    )
+
+    return conteo["ultimo_acceso"]
+
+
+def mostrar_conteo_accesos():
+    conteo = cargar_conteo_accesos()
+    fecha = datetime.now().strftime("%Y-%m-%d")
+    total_hoy = conteo.get("por_fecha", {}).get(fecha, 0)
+
+    print("\n================================")
+    print(" CONTEO DE ENTRADAS ")
+    print("================================")
+    print(f"Total general: {conteo.get('total', 0)}")
+    print(f"Total de hoy: {total_hoy}")
+
+    ultimo = conteo.get("ultimo_acceso")
+    if ultimo:
+        print(f"Ultimo acceso: {ultimo.get('usuario')} | {ultimo.get('fecha_hora')}")
+
+
+# ============================================================
+# EVIDENCIAS
+# ============================================================
+
+def guardar_evidencia(picam2, motivo="ERROR"):
+    try:
+        if picam2 is None:
+            frame = obtener_frame_vista_camara_etapa1(timeout=0.2)
+            if frame is None:
+                registrar_evento(f"EVIDENCIA NO POSIBLE (sin camara): {motivo}")
+                return None
+        else:
+            frame = capturar_frame_etapa1(picam2)
+
+        nombre = time.strftime(
+            os.path.join(EVIDENCIAS_DIR, f"%Y%m%d_%H%M%S_{motivo}.jpg")
+        )
+        cv2.imwrite(nombre, frame)
+        registrar_evento(f"EVIDENCIA GUARDADA ({motivo}) -> {nombre}")
+        return nombre
+    except Exception as e:
+        registrar_evento(f"ERROR AL GUARDAR EVIDENCIA ({motivo}): {e}")
+        return None
+
+
+# ============================================================
+# HUELLA R503
+# ============================================================
+
+def crear_sensor_huella():
+    uart = serial.Serial("/dev/ttyAMA0", 57600, timeout=1)
+    return adafruit_fingerprint.Adafruit_Fingerprint(uart)
+
+
+def cerrar_sensor_huella(finger_obj):
+    if finger_obj is None:
+        return
+
+    for atributo in ("_uart", "uart", "serial"):
+        puerto = getattr(finger_obj, atributo, None)
+        if puerto is not None and hasattr(puerto, "close"):
+            try:
+                puerto.close()
+            except Exception:
+                pass
+            return
+
+
+def set_led_huella(finger_obj, color, modo, velocidad=0, ciclos=0):
+    if finger_obj is None:
+        return
+
+    try:
+        finger_obj.set_led(color, modo, velocidad, ciclos)
+    except Exception:
+        pass
+
+
+def led_apagado(finger_obj=None):
+    set_led_huella(finger_obj, 1, 4, 0, 0)
+
+
+def led_azul(finger_obj=None):
+    set_led_huella(finger_obj, 2, 3, 0, 0)
+
+
+def led_rojo(finger_obj=None):
+    set_led_huella(finger_obj, 1, 3, 0, 0)
+
+
+def led_morado(finger_obj=None):
+    set_led_huella(finger_obj, 3, 3, 0, 0)
+
+
+def nombre_estado_huella(codigo):
+    estados = [
+        ("OK", "OK"),
+        ("NOFINGER", "SIN_DEDO"),
+        ("IMAGEFAIL", "ERROR_IMAGEN"),
+        ("IMAGEMESS", "IMAGEN_SUCIA"),
+        ("FEATUREFAIL", "SIN_RASGOS"),
+        ("INVALIDIMAGE", "IMAGEN_INVALIDA"),
+        ("PACKETRECIEVEERR", "ERROR_COMUNICACION"),
+        ("BADPACKET", "PAQUETE_INVALIDO"),
+        ("NOTFOUND", "NO_ENCONTRADA"),
+    ]
+
+    for constante, nombre in estados:
+        valor = getattr(adafruit_fingerprint, constante, None)
+        if valor is not None and codigo == valor:
+            return nombre
+
+    return f"CODIGO_{codigo}"
+
+
+def obtener_id_huella_libre(finger_obj):
+    try:
+        finger_obj.read_templates()
+        usados = set(int(x) for x in finger_obj.templates)
+    except Exception:
+        usados = set()
+
+    for idx in range(1, 128):
+        if idx not in usados:
+            return idx
+    return None
+
+
+def registrar_huella():
+    try:
+        finger_local = crear_sensor_huella()
+    except Exception as e:
+        print(f"\nNo se pudo abrir el sensor R503: {e}")
+        registrar_evento(f"ERROR SENSOR HUELLA: {e}")
+        return None
+
+    try:
+        finger_local.set_led(2, 3, 0, 0)
+    except Exception:
+        pass
+
+    nuevo_id = obtener_id_huella_libre(finger_local)
+    if nuevo_id is None:
+        print("\nNo hay IDs libres en el sensor.")
+        registrar_evento("NO HAY IDS LIBRES EN SENSOR")
+        return None
+
+    print("\n================================")
+    print(" REGISTRO DE HUELLA ")
+    print("================================")
+    print(f"Se usará el ID: {nuevo_id}")
+    print("Coloca el dedo...")
+
+    while True:
+        estado = finger_local.get_image()
+        if estado == adafruit_fingerprint.OK:
+            try:
+                finger_local.set_led(2, 3, 0, 0)
+            except Exception:
+                pass
+            break
+        time.sleep(0.1)
+
+    print("Imagen capturada")
+
+    if finger_local.image_2_tz(1) != adafruit_fingerprint.OK:
+        print("Error convirtiendo la primera imagen.")
+        registrar_evento("ERROR EN PRIMER TEMPLATE DE HUELLA")
+        try:
+            finger_local.set_led(1, 3, 0, 0)
+            time.sleep(TIEMPO_LED_RECHAZO)
+        except Exception:
+            pass
+        return None
+
+    print("Retira el dedo...")
+    while finger_local.get_image() != adafruit_fingerprint.NOFINGER:
+        time.sleep(0.1)
+
+    time.sleep(0.8)
+    print("Coloca el MISMO dedo nuevamente...")
+
+    while finger_local.get_image() != adafruit_fingerprint.OK:
+        time.sleep(0.1)
+
+    print("Segunda imagen capturada")
+
+    if finger_local.image_2_tz(2) != adafruit_fingerprint.OK:
+        print("Error convirtiendo la segunda imagen.")
+        registrar_evento("ERROR EN SEGUNDO TEMPLATE DE HUELLA")
+        try:
+            finger_local.set_led(1, 3, 0, 0)
+            time.sleep(TIEMPO_LED_RECHAZO)
+        except Exception:
+            pass
+        return None
+
+    if finger_local.create_model() != adafruit_fingerprint.OK:
+        print("Las huellas no coinciden.")
+        registrar_evento("HUELLAS NO COINCIDEN")
+        try:
+            finger_local.set_led(1, 3, 0, 0)
+            time.sleep(TIEMPO_LED_RECHAZO)
+        except Exception:
+            pass
+        return None
+
+    if finger_local.store_model(nuevo_id) != adafruit_fingerprint.OK:
+        print("Error guardando la huella en el sensor.")
+        registrar_evento("ERROR AL GUARDAR HUELLA EN SENSOR")
+        try:
+            finger_local.set_led(1, 3, 0, 0)
+            time.sleep(TIEMPO_LED_RECHAZO)
+        except Exception:
+            pass
+        return None
+
+    print("\n================================")
+    print(" HUELLA REGISTRADA ")
+    print(f" ID: {nuevo_id}")
+    print("================================")
+    registrar_evento(f"HUELLA REGISTRADA ID={nuevo_id}")
+
+    try:
+        finger_local.set_led(3, 3, 0, 0)
+        time.sleep(TIEMPO_LED_ACEPTACION)
+    except Exception:
+        pass
+
+    try:
+        finger_local.set_led(1, 4, 0, 0)
+    except Exception:
+        pass
+
+    return nuevo_id
+
+
+def eliminar_huella_por_id(fingerprint_id):
+    if fingerprint_id in (None, "", 0):
+        return True
+
+    finger_local = None
+    try:
+        finger_local = crear_sensor_huella()
+        res = finger_local.delete_model(int(fingerprint_id))
+        if res == adafruit_fingerprint.OK:
+            print(f"Huella ID {fingerprint_id} eliminada del sensor.")
+            registrar_evento(f"HUELLA ELIMINADA ID={fingerprint_id}")
+            return True
+        print(f"No se pudo eliminar la huella ID {fingerprint_id}.")
+        registrar_evento(f"NO SE PUDO ELIMINAR HUELLA ID={fingerprint_id}")
+        return False
+    except Exception as e:
+        print(f"No fue posible eliminar la huella ID {fingerprint_id}: {e}")
+        registrar_evento(f"ERROR ELIMINANDO HUELLA ID={fingerprint_id}: {e}")
+        return False
+    finally:
+        cerrar_sensor_huella(finger_local)
+
+
+def verificar_huella():
+    """
+    Devuelve el finger_id si la huella es válida; None si falla.
+    """
+    finger_local = None
+    try:
+        finger_local = crear_sensor_huella()
+    except Exception as e:
+        registrar_evento(f"ERROR INICIANDO SENSOR DE HUELLA: {e}")
+        return None
+
+    try:
+        registrar_evento("VERIFICACION DE HUELLA INICIADA")
+
+        try:
+            finger_local.read_templates()
+            registrar_evento(f"PLANTILLAS EN SENSOR: {list(finger_local.templates)}")
+        except Exception as e:
+            registrar_evento(f"NO SE PUDIERON LEER PLANTILLAS DEL SENSOR: {e}")
+
+        print("Coloca el dedo registrado en el sensor...")
+        led_azul(finger_local)
+
+        inicio = time.time()
+        ultimo_estado = None
+
+        while True:
+            if time.time() - inicio > TIEMPO_MAX_HUELLA:
+                estado_txt = nombre_estado_huella(ultimo_estado)
+                registrar_evento(f"TIMEOUT EN HUELLA (ULTIMO ESTADO: {estado_txt})")
+                return None
+
+            estado = finger_local.get_image()
+
+            if estado != ultimo_estado:
+                registrar_evento(f"ESTADO SENSOR HUELLA: {nombre_estado_huella(estado)}")
+                ultimo_estado = estado
+
+            if estado != adafruit_fingerprint.OK:
+                time.sleep(0.08)
+                continue
+
+            if finger_local.image_2_tz(1) != adafruit_fingerprint.OK:
+                registrar_evento("ERROR AL CONVERTIR IMAGEN DE HUELLA")
+                led_rojo(finger_local)
+                time.sleep(TIEMPO_LED_RECHAZO)
+                return None
+
+            if finger_local.finger_search() != adafruit_fingerprint.OK:
+                registrar_evento("HUELLA NO ENCONTRADA")
+                led_rojo(finger_local)
+                time.sleep(TIEMPO_LED_RECHAZO)
+                return None
+
+            if finger_local.confidence < UMBRAL_HUELLA:
+                registrar_evento(
+                    f"HUELLA BAJA CONFIANZA ID={finger_local.finger_id} CONF={finger_local.confidence}"
+                )
+                led_rojo(finger_local)
+                time.sleep(TIEMPO_LED_RECHAZO)
+                return None
+
+            registrar_evento(
+                f"HUELLA VALIDADA ID={finger_local.finger_id} CONF={finger_local.confidence}"
+            )
+            led_morado(finger_local)
+            time.sleep(TIEMPO_LED_ACEPTACION)
+            return finger_local.finger_id
+    finally:
+        led_apagado(finger_local)
+        cerrar_sensor_huella(finger_local)
+
+
+# ============================================================
+# CÁMARA / ROSTROS
+# ============================================================
+
+def crear_camara():
+    gc.collect()
+    time.sleep(1)
+
+    try:
+        picam2 = Picamera2(camera_num=CAMARA_ETAPA1_ID)
+        config = picam2.create_preview_configuration(
+            main={"size": CAMERA_SIZE, "format": "RGB888"}
+        )
+        picam2.configure(config)
+        picam2.start()
+        time.sleep(2)
+        registrar_evento("CAMARA ETAPA 1 INICIADA")
+        return picam2
+    except Exception as e:
+        print(f"No se pudo iniciar la cámara: {e}")
+        registrar_evento(f"ERROR INICIANDO CAMARA: {e}")
+        return None
+
+
+def cerrar_camara(picam2):
+    if picam2 is None:
+        return
+
+    try:
+        picam2.stop()
+    except Exception:
+        pass
+
+    try:
+        picam2.close()
+    except Exception:
+        pass
+
+    try:
+        del picam2
+    except Exception:
+        pass
+
+    gc.collect()
+    for ventana in ("Registro Facial", "Prueba LBPH", "Sistema de Seguridad"):
+        try:
+            cv2.destroyWindow(ventana)
+            cv2.waitKey(1)
+        except Exception:
+            pass
+    time.sleep(1)
+
+
+def _abrir_camara_etapa1_preview():
+    try:
+        camara = Picamera2(camera_num=CAMARA_ETAPA1_ID)
+        camara.configure(
+            camara.create_preview_configuration(
+                main={"size": CAMERA_SIZE, "format": "RGB888"},
+            )
+        )
+        camara.start()
+        time.sleep(1)
+        registrar_evento("VISTA CAMARA ETAPA 1 INICIADA")
+        return camara
+    except Exception as e:
+        registrar_evento(f"ERROR INICIANDO VISTA CAMARA ETAPA 1: {e}")
+        return None
+
+
+def _vista_camara_etapa1_loop():
+    global etapa1_preview_frame
+
+    camara = None
+    try:
+        while not etapa1_preview_detener.is_set():
+            if camara is None:
+                camara = _abrir_camara_etapa1_preview()
+                if camara is None:
+                    time.sleep(2)
+                    continue
+                registrar_evento_silencioso("VISTA CAMARA ETAPA 1 EN EJECUCION")
+
+            try:
+                frame_rgb = camara.capture_array()
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                with etapa1_preview_lock:
+                    etapa1_preview_frame = frame_bgr
+            except Exception as e:
+                registrar_evento(f"ERROR VISTA CAMARA ETAPA 1: {e}")
+                try:
+                    camara.stop()
+                    camara.close()
+                except Exception:
+                    pass
+                camara = None
+                time.sleep(1)
+                continue
+
+            time.sleep(0.04)
+    finally:
+        if camara is not None:
+            try:
+                camara.stop()
+                camara.close()
+            except Exception:
+                pass
+        registrar_evento("VISTA CAMARA ETAPA 1 DETENIDA")
+
+
+def iniciar_vista_camara_etapa1():
+    global etapa1_preview_hilo
+
+    if etapa1_preview_hilo is not None and etapa1_preview_hilo.is_alive():
+        return
+
+    etapa1_preview_detener.clear()
+    etapa1_preview_hilo = Thread(
+        target=_vista_camara_etapa1_loop,
+        name="VistaCamaraEtapa1",
+        daemon=True,
+    )
+    etapa1_preview_hilo.start()
+
+
+def detener_vista_camara_etapa1():
+    etapa1_preview_detener.set()
+    if etapa1_preview_hilo is not None and etapa1_preview_hilo.is_alive():
+        etapa1_preview_hilo.join(timeout=3)
+
+
+def obtener_frame_vista_camara_etapa1(timeout=0.0):
+    iniciar_vista_camara_etapa1()
+    fin = time.time() + max(0.0, float(timeout))
+
+    while True:
+        with etapa1_preview_lock:
+            if etapa1_preview_frame is not None:
+                return etapa1_preview_frame.copy()
+
+        if time.time() >= fin:
+            return None
+
+        time.sleep(0.03)
+
+
+def capturar_frame_etapa1(picam2=None):
+    if picam2 is not None:
+        frame_rgb = picam2.capture_array()
+        return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+    return obtener_frame_vista_camara_etapa1(timeout=2.0)
+
+
+def obtener_rostro_mayor(caras):
+    if len(caras) == 0:
+        return None
+    return max(caras, key=lambda c: c[2] * c[3])
+
+
+def cargar_clasificador_ojos():
+    for archivo in (
+        "haarcascade_eye_tree_eyeglasses.xml",
+        "haarcascade_eye.xml",
+    ):
+        ruta = cv2.data.haarcascades + archivo
+        clasificador = cv2.CascadeClassifier(ruta)
+        if not clasificador.empty():
+            return clasificador
+    return None
+
+
+def detectar_ojos_abiertos(gris, cara, clasificador_ojos):
+    if clasificador_ojos is None:
+        return False, 0, []
+
+    x, y, w, h = cara
+    margen_x = max(4, int(w * 0.08))
+    roi_x = x + margen_x
+    roi_y = y + max(4, int(h * 0.18))
+    roi_w = max(1, w - margen_x * 2)
+    roi_h = max(1, int(h * 0.36))
+
+    roi = gris[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+    if roi.size == 0:
+        return False, 0, []
+
+    min_ojo_w = max(12, int(w * 0.12))
+    min_ojo_h = max(8, int(h * 0.08))
+    ojos = clasificador_ojos.detectMultiScale(
+        roi,
+        scaleFactor=1.1,
+        minNeighbors=4,
+        minSize=(min_ojo_w, min_ojo_h),
+    )
+
+    ojos_filtrados = []
+    for ex, ey, ew, eh in ojos:
+        if ew * eh < min_ojo_w * min_ojo_h:
+            continue
+        ojos_filtrados.append((roi_x + ex, roi_y + ey, ew, eh))
+
+    return (
+        len(ojos_filtrados) >= max(1, PARPADEO_MIN_OJOS_ABIERTOS),
+        len(ojos_filtrados),
+        ojos_filtrados,
+    )
+
+
+def reiniciar_prueba_parpadeo(estado_vida):
+    estado_vida["rostro_id"] = None
+    estado_vida["fase"] = "ojos_abiertos"
+    estado_vida["abiertos"] = 0
+    estado_vida["cerrados"] = 0
+    estado_vida["ok"] = not VENTANA1_REQUIERE_PARPADEO
+    estado_vida["evento_ok"] = False
+
+
+def actualizar_prueba_parpadeo(estado_vida, ojos_abiertos, rostro_id):
+    if estado_vida.get("rostro_id") != rostro_id:
+        estado_vida["rostro_id"] = rostro_id
+        estado_vida["fase"] = "ojos_abiertos"
+        estado_vida["abiertos"] = 0
+        estado_vida["cerrados"] = 0
+        estado_vida["ok"] = False
+        estado_vida["evento_ok"] = False
+
+    if ojos_abiertos:
+        estado_vida["abiertos"] += 1
+        estado_vida["cerrados"] = 0
+    else:
+        estado_vida["cerrados"] += 1
+        estado_vida["abiertos"] = 0
+
+    if estado_vida["ok"]:
+        return True, "Vida OK"
+
+    fase = estado_vida["fase"]
+    if fase == "ojos_abiertos":
+        if estado_vida["abiertos"] >= PARPADEO_MIN_CUADROS_ABIERTO:
+            estado_vida["fase"] = "cierra_ojos"
+        return False, "Parpadea"
+
+    if fase == "cierra_ojos":
+        if estado_vida["cerrados"] >= PARPADEO_MIN_CUADROS_CERRADO:
+            estado_vida["fase"] = "abre_ojos"
+            return False, "Abre los ojos"
+        return False, "Cierra y abre ojos"
+
+    if fase == "abre_ojos":
+        if estado_vida["abiertos"] >= PARPADEO_MIN_CUADROS_ABIERTO:
+            estado_vida["ok"] = True
+            estado_vida["evento_ok"] = True
+            return True, "Vida OK"
+        return False, "Abre los ojos"
+
+    return False, "Parpadea"
+
+
+def capturar_rostros(nombre, total=TARGET_FACES):
+    nombre = normalizar_nombre(nombre)
+    carpeta = os.path.join(ROSTROS_DIR, nombre)
+
+    if os.path.exists(carpeta):
+        shutil.rmtree(carpeta, ignore_errors=True)
+
+    os.makedirs(carpeta, exist_ok=True)
+
+    clasificador = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    if clasificador.empty():
+        print("No se pudo cargar el clasificador de rostros.")
+        registrar_evento("ERROR CARGANDO HAAR CASCADE")
+        return 0
+
+    detener_vista_camara_etapa1()
+    picam2 = crear_camara()
+    if picam2 is None:
+        iniciar_vista_camara_etapa1()
+        return 0
+
+    contador = 0
+    ultimo_guardado = 0.0
+
+    print("\n================================")
+    print(" CAPTURA DE ROSTROS ")
+    print("================================")
+    print("Colócate frente a la cámara.")
+    print("Presiona Q para salir.")
+
+    ventana2_registro_activo.set()
+
+    try:
+        while contador < total:
+            frame_rgb = picam2.capture_array()
+            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            caras = clasificador.detectMultiScale(
+                gris,
+                scaleFactor=1.2,
+                minNeighbors=5,
+                minSize=(80, 80)
+            )
+
+            cara = obtener_rostro_mayor(caras)
+
+            if cara is not None:
+                x, y, w, h = cara
+                rostro = gris[y:y + h, x:x + w]
+                rostro = cv2.resize(rostro, FACE_SIZE)
+
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (80, 245, 120), 2)
+
+                ahora = time.time()
+                if ahora - ultimo_guardado >= MIN_SAMPLE_INTERVAL:
+                    archivo = os.path.join(carpeta, f"rostro_{contador}.jpg")
+                    cv2.imwrite(archivo, rostro)
+                    contador += 1
+                    ultimo_guardado = ahora
+                    print(f"Rostro guardado: {contador}/{total}")
+
+                estado = "Rostro detectado"
+            else:
+                estado = "Buscando rostro"
+
+            _mostrar_panel_ventana2(
+                "Captura de rostros",
+                [
+                    f"Usuario: {nombre}",
+                    f"Capturas: {contador}/{total}",
+                    estado,
+                    "Mira de frente a la camara.",
+                ],
+                pie="Q o Esc cancelar",
+                frame_base=frame,
+            )
+            tecla = _esperar_tecla_ventana2()
+            if tecla in ("q", "Q", "*"):
+                break
+
+    finally:
+        ventana2_registro_activo.clear()
+        cerrar_camara(picam2)
+        iniciar_vista_camara_etapa1()
+        ventana2_mostrar_registros_etapa2("Captura facial finalizada")
+
+    print(f"\nCaptura finalizada. Se guardaron {contador} rostros.")
+    registrar_evento(f"CAPTURA DE ROSTROS FINALIZADA NOMBRE={nombre} CANTIDAD={contador}")
+    return contador
+
+
+def entrenar_lbph():
+    if not os.path.exists(ROSTROS_DIR):
+        print("No existe la carpeta de rostros.")
+        registrar_evento("NO EXISTE CARPETA DE ROSTROS")
+        return False
+
+    if not hasattr(cv2, "face"):
+        print("OpenCV no tiene cv2.face. Instala opencv-contrib-python.")
+        registrar_evento("OPENCV SIN MODULO FACE")
+        return False
+
+    try:
+        recognizer = cv2.face.LBPHFaceRecognizer_create()
+    except Exception as e:
+        print(f"No se pudo crear el reconocedor LBPH: {e}")
+        registrar_evento(f"ERROR CREANDO RECONOCEDOR LBPH: {e}")
+        return False
+
+    rostros = []
+    labels = []
+    label_map = {}
+
+    carpetas = [
+        d for d in sorted(os.listdir(ROSTROS_DIR))
+        if os.path.isdir(os.path.join(ROSTROS_DIR, d))
+    ]
+
+    label_actual = 1
+
+    for persona in carpetas:
+        carpeta_persona = os.path.join(ROSTROS_DIR, persona)
+        imagenes = sorted(os.listdir(carpeta_persona))
+
+        tiene_imagenes = False
+        for archivo in imagenes:
+            if not archivo.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+
+            ruta_img = os.path.join(carpeta_persona, archivo)
+            img = cv2.imread(ruta_img, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+
+            if img.shape != FACE_SIZE:
+                img = cv2.resize(img, FACE_SIZE)
+
+            rostros.append(img)
+            labels.append(label_actual)
+            tiene_imagenes = True
+
+        if tiene_imagenes:
+            label_map[str(label_actual)] = persona
+            print(f"ID LBPH {label_actual} -> {persona}")
+            label_actual += 1
+
+    if not rostros:
+        print("No hay imágenes suficientes para entrenar el modelo.")
+        registrar_evento("NO HAY IMAGENES PARA ENTRENAR LBPH")
+        if os.path.exists(MODELO_FILE):
+            try:
+                os.remove(MODELO_FILE)
+            except Exception:
+                pass
+        guardar_json(ROSTRO_IDS_FILE, {})
+        return False
+
+    print("\n================================")
+    print(" ENTRENANDO MODELO LBPH ")
+    print("================================")
+
+    recognizer.train(rostros, np.array(labels))
+    recognizer.write(MODELO_FILE)
+
+    guardar_json(ROSTRO_IDS_FILE, label_map)
+
+    usuarios = cargar_usuarios()
+    for nombre, datos in usuarios.items():
+        nombre_norm = normalizar_nombre(nombre)
+        rostro_id = None
+        for id_txt, persona in label_map.items():
+            if normalizar_nombre(persona) == nombre_norm:
+                rostro_id = int(id_txt)
+                break
+        datos["rostro_id"] = rostro_id
+    guardar_usuarios(usuarios)
+
+    print("\nMODELO ENTRENADO")
+    print("Archivo:")
+    print(MODELO_FILE)
+
+    print("\nMAPEO GENERADO:")
+    print(label_map)
+
+    registrar_evento(f"MODELO LBPH ENTRENADO -> {MODELO_FILE}")
+    return True
+
+
+def cargar_mapa_rostros():
+    return cargar_json(ROSTRO_IDS_FILE, {})
+
+
+def cargar_modelo_lbph():
+    if not os.path.exists(MODELO_FILE):
+        raise FileNotFoundError(f"No existe el modelo LBPH: {MODELO_FILE}")
+
+    if not hasattr(cv2, "face"):
+        raise RuntimeError("OpenCV sin módulo face. Instala opencv-contrib-python.")
+
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer.read(MODELO_FILE)
+    return recognizer
+
+
+def _dibujar_estado(frame, x, y, w, h, color_bgr, texto, grosor=2):
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color_bgr, grosor)
+    cv2.putText(
+        frame,
+        texto,
+        (x, max(0, y - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        color_bgr,
+        2
+    )
+
+
+def verificar_rostro(picam2, clasificador, modelo, mapa_rostros):
+    """
+    Devuelve un dict:
+        {
+            "id": id_lbph,
+            "nombre": nombre_normalizado,
+            "confianza": valor
+        }
+    o None si falla.
+    """
+    registrar_evento("VERIFICACION DE ROSTRO INICIADA")
+    print("Abriendo ventana de camara Etapa 1 para reconocimiento facial...")
+    inicio = time.time()
+    mejor_rostro = None
+    estado_vida = {
+        "rostro_id": None,
+        "fase": "ojos_abiertos",
+        "abiertos": 0,
+        "cerrados": 0,
+        "ok": not VENTANA1_REQUIERE_PARPADEO,
+        "evento_ok": False,
+    }
+    clasificador_ojos = None
+    etapa1_ventana_activa.set()
+    time.sleep(0.2)
+
+    try:
+        _configurar_ventana(
+            VENTANA_ETAPA1,
+            VENTANA_ETAPA1_SIZE[0],
+            VENTANA_ETAPA1_SIZE[1],
+            VENTANA_ETAPA1_POS,
+            VENTANA1_FULLSCREEN,
+        )
+        cv2.waitKey(1)
+    except Exception as e:
+        registrar_evento(f"ERROR CREANDO VENTANA ETAPA 1: {e}")
+
+    if VENTANA1_REQUIERE_PARPADEO:
+        clasificador_ojos = cargar_clasificador_ojos()
+        if clasificador_ojos is None:
+            registrar_evento("ERROR CARGANDO CLASIFICADOR DE OJOS")
+            ventana1_mostrar_accesos("DENEGADO", "Antifraude no disponible")
+            return None
+
+    try:
+        while True:
+            if time.time() - inicio > TIEMPO_MAX_ROSTRO:
+                if mejor_rostro is not None:
+                    registrar_evento(
+                        "TIMEOUT EN ROSTRO - MEJOR INTENTO "
+                        f"ID={mejor_rostro['id']} NOMBRE={mejor_rostro['nombre']} "
+                        f"CONF={mejor_rostro['confianza']}"
+                    )
+                    guardar_evidencia(picam2, "ROSTRO_INVALIDO")
+                registrar_evento("TIMEOUT EN ROSTRO")
+                return None
+
+            try:
+                frame = capturar_frame_etapa1(picam2)
+            except Exception as e:
+                registrar_evento(f"ERROR CAPTURA CAMARA: {e}")
+                return None
+
+            if frame is None:
+                registrar_evento("ERROR CAPTURA CAMARA: sin frame")
+                ventana1_mostrar_accesos("PROCESO", "Camara iniciando")
+                time.sleep(0.1)
+                continue
+
+            gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            caras = clasificador.detectMultiScale(
+                gris,
+                scaleFactor=1.2,
+                minNeighbors=5,
+                minSize=(80, 80)
+            )
+
+            if len(caras) == 0:
+                reiniciar_prueba_parpadeo(estado_vida)
+                ventana1_mostrar_accesos(
+                    "PROCESO",
+                    "Buscando rostro",
+                    camara_frame=frame,
+                    rostro_estado="BUSCANDO",
+                )
+                cv2.waitKey(1)
+                continue
+
+            caras = sorted(caras, key=lambda c: c[2] * c[3], reverse=True)
+            x, y, w, h = caras[0]
+
+            rostro = gris[y:y + h, x:x + w]
+            rostro = cv2.resize(rostro, FACE_SIZE)
+
+            try:
+                id_usuario, confianza = modelo.predict(rostro)
+            except Exception as e:
+                registrar_evento(f"ERROR AL PREDICIR ROSTRO: {e}")
+                guardar_evidencia(picam2, "ERROR_ROSTRO")
+                return None
+
+            nombre = mapa_rostros.get(str(id_usuario), f"ID_{id_usuario}")
+            registrar_evento(
+                f"ROSTRO DETECTADO ID={id_usuario} NOMBRE={nombre} CONF={confianza}"
+            )
+
+            if mejor_rostro is None or confianza < mejor_rostro["confianza"]:
+                mejor_rostro = {
+                    "id": int(id_usuario),
+                    "nombre": nombre,
+                    "confianza": float(confianza)
+                }
+
+            rostro_valido = confianza < FACE_THRESHOLD
+            ojos_abiertos = False
+            ojos_detectados = 0
+            cajas_ojos = []
+            parpadeo_ok = bool(estado_vida.get("ok"))
+            mensaje_vida = "Mira a la camara"
+
+            if rostro_valido and VENTANA1_REQUIERE_PARPADEO:
+                ojos_abiertos, ojos_detectados, cajas_ojos = detectar_ojos_abiertos(
+                    gris,
+                    (x, y, w, h),
+                    clasificador_ojos,
+                )
+                parpadeo_ok, mensaje_vida = actualizar_prueba_parpadeo(
+                    estado_vida,
+                    ojos_abiertos,
+                    int(id_usuario),
+                )
+                if estado_vida.get("evento_ok"):
+                    registrar_evento(f"PRUEBA DE VIDA OK POR PARPADEO: {nombre}")
+                    estado_vida["evento_ok"] = False
+            elif not rostro_valido:
+                reiniciar_prueba_parpadeo(estado_vida)
+
+            if confianza < 45:
+                color_rostro = (255, 45, 255)
+                estado_rostro = "CONOCIDO"
+                texto_rostro = f"USUARIO: {nombre}"
+            elif confianza < FACE_THRESHOLD:
+                color_rostro = (255, 180, 35)
+                estado_rostro = "CONOCIDO"
+                texto_rostro = f"USUARIO: {nombre}"
+            else:
+                color_rostro = (45, 65, 240)
+                estado_rostro = "DESCONOCIDO"
+                texto_rostro = "ROSTRO DESCONOCIDO"
+
+            if rostro_valido and VENTANA1_REQUIERE_PARPADEO and not parpadeo_ok:
+                color_rostro = (255, 225, 40)
+                estado_rostro = "PARPADEA"
+                texto_rostro = mensaje_vida
+            elif rostro_valido and parpadeo_ok:
+                color_rostro = (90, 230, 90)
+                estado_rostro = "VIDA OK"
+                texto_rostro = f"USUARIO: {nombre}"
+
+            _dibujar_estado(
+                frame,
+                x,
+                y,
+                w,
+                h,
+                color_rostro,
+                texto_rostro,
+                grosor=3
+            )
+            for ex, ey, ew, eh in cajas_ojos:
+                cv2.rectangle(frame, (ex, ey), (ex + ew, ey + eh), color_rostro, 1)
+
+            ventana1_mostrar_accesos(
+                "PROCESO",
+                mensaje_vida if rostro_valido else "Mira a la camara",
+                camara_frame=frame,
+                rostro_nombre=nombre if estado_rostro != "DESCONOCIDO" else "No identificado",
+                rostro_estado=estado_rostro,
+                rostro_confianza=confianza,
+            )
+            cv2.waitKey(1)
+
+            if rostro_valido and parpadeo_ok:
+                ventana1_guardar_rostro(
+                    frame,
+                    nombre=nombre,
+                    estado="VERIFICADO",
+                    confianza=confianza,
+                )
+                registrar_evento(
+                    f"ROSTRO VALIDO CON VIDA ID={id_usuario} NOMBRE={nombre} "
+                    f"CONF={confianza} OJOS={ojos_detectados}"
+                )
+                time.sleep(0.3)
+                ventana1_mostrar_accesos("PROCESO", "Rostro verificado", usar_ultimo_rostro=True)
+                return {
+                    "id": int(id_usuario),
+                    "nombre": nombre,
+                    "confianza": float(confianza)
+                }
+            elif rostro_valido:
+                time.sleep(0.08)
+                continue
+            else:
+                registrar_evento(
+                    f"ROSTRO INVALIDO ID={id_usuario} NOMBRE={nombre} CONF={confianza}"
+                )
+                time.sleep(0.15)
+                continue
+    finally:
+        etapa1_ventana_activa.clear()
+
+
+def verificar_rostro_con_camara(clasificador, modelo, mapa_rostros):
+    iniciar_vista_camara_etapa1()
+    return verificar_rostro(None, clasificador, modelo, mapa_rostros)
+
+
+def consola_pidio_salir():
+    try:
+        listo, _, _ = select.select([sys.stdin], [], [], 0)
+    except Exception:
+        return False
+
+    if not listo:
+        return False
+
+    try:
+        texto = sys.stdin.readline().strip().lower()
+    except Exception:
+        return False
+
+    return texto.startswith("q")
+
+
+def probar_reconocimiento_facial():
+    if not os.path.exists(MODELO_FILE):
+        print("No existe el modelo LBPH. Primero entrena el modelo.")
+        registrar_evento("PRUEBA LBPH FALLIDA: MODELO NO EXISTE")
+        return
+
+    try:
+        modelo = cargar_modelo_lbph()
+    except Exception as e:
+        print(f"No se pudo cargar el modelo: {e}")
+        registrar_evento(f"ERROR CARGANDO MODELO: {e}")
+        return
+
+    mapa = cargar_mapa_rostros()
+    clasificador = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    detener_vista_camara_etapa1()
+    picam2 = crear_camara()
+    if picam2 is None:
+        iniciar_vista_camara_etapa1()
+        return
+
+    print("\n================================")
+    print(" PRUEBA DE RECONOCIMIENTO FACIAL ")
+    print("================================")
+    print("Haz clic en la ventana y presiona Q o ESC para salir.")
+    print("Tambien puedes escribir Q + ENTER en la consola.")
+
+    etapa1_ventana_activa.set()
+    ventana2_registro_activo.set()
+
+    try:
+        while True:
+            if consola_pidio_salir():
+                break
+
+            frame_rgb = picam2.capture_array()
+            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            resultado = "Sin rostro detectado"
+            detalle = ""
+
+            caras = clasificador.detectMultiScale(
+                gris,
+                scaleFactor=1.2,
+                minNeighbors=5,
+                minSize=(80, 80)
+            )
+
+            for (x, y, w, h) in caras:
+                rostro = gris[y:y + h, x:x + w]
+                rostro = cv2.resize(rostro, FACE_SIZE)
+
+                try:
+                    id_usuario, confianza = modelo.predict(rostro)
+                except Exception:
+                    continue
+
+                nombre = mapa.get(str(id_usuario), "DESCONOCIDO")
+
+                if confianza < 45:
+                    color = (255, 0, 255)
+                    resultado = f"Reconocido: {nombre}"
+                    detalle = f"Confianza: {confianza:.0f}"
+                    try:
+                        led_morado()
+                    except Exception:
+                        pass
+                elif confianza < FACE_THRESHOLD:
+                    color = (255, 0, 0)
+                    resultado = f"Reconocido: {nombre}"
+                    detalle = f"Confianza: {confianza:.0f}"
+                    try:
+                        led_azul()
+                    except Exception:
+                        pass
+                else:
+                    color = (0, 0, 255)
+                    resultado = "Desconocido"
+                    detalle = f"Confianza: {confianza:.0f}"
+                    try:
+                        led_rojo()
+                    except Exception:
+                        pass
+
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+            _mostrar_panel_ventana2(
+                "Prueba de rostro",
+                [
+                    resultado,
+                    detalle,
+                    "Mira de frente a la camara.",
+                ],
+                pie="Q o Esc salir",
+                frame_base=frame,
+            )
+            tecla = _esperar_tecla_ventana2()
+
+            if tecla in ("q", "Q", "*"):
+                break
+
+            try:
+                if cv2.getWindowProperty(VENTANA_ETAPA2, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except Exception:
+                pass
+
+    finally:
+        etapa1_ventana_activa.clear()
+        ventana2_registro_activo.clear()
+        cerrar_camara(picam2)
+        iniciar_vista_camara_etapa1()
+        ventana2_mostrar_registros_etapa2("Prueba facial finalizada")
+        led_apagado()
+
+
+# ============================================================
+# PASSWORDS
+# ============================================================
+
+def pedir_password(tipo_password="usuario", nombre_usuario=None):
+    """
+    Solicita contraseña por teclado matricial.
+    '*' borra, '#' confirma.
+    """
+    entrada = ""
+    inicio = time.time()
+    tipo_password = str(tipo_password or "usuario").upper()
+    nombre_usuario = normalizar_nombre(nombre_usuario) if nombre_usuario else ""
+    encabezado = f"Password {tipo_password}"
+    if nombre_usuario:
+        encabezado = f"{nombre_usuario[:10]} {tipo_password}"
+
+    registrar_evento(f"INGRESO DE PASSWORD {tipo_password} INICIADO")
+    ventana1_mostrar_accesos("PROCESO", f"{encabezado}: _", usar_ultimo_rostro=True)
+
+    while True:
+        if time.time() - inicio > TIEMPO_MAX_PASSWORD:
+            registrar_evento("TIMEOUT EN PASSWORD")
+            ventana1_mostrar_accesos("DENEGADO", "Timeout password", usar_ultimo_rostro=True)
+            return None
+
+        tecla = leer_tecla()
+        if tecla is None:
+            cv2.waitKey(1)
+            continue
+
+        if tecla == '*':
+            entrada = ""
+            print("PASSWORD BORRADA")
+            registrar_evento("PASSWORD BORRADA")
+            ventana1_mostrar_accesos("PROCESO", f"{encabezado}: _", usar_ultimo_rostro=True)
+
+        elif tecla == '#':
+            if len(entrada) < MIN_CARACTERES:
+                print("========================")
+                print(" PASSWORD MUY CORTA ")
+                print("========================")
+                registrar_evento("PASSWORD MUY CORTA")
+                ventana1_mostrar_accesos("DENEGADO", "Password muy corta", usar_ultimo_rostro=True)
+                return None
+
+            registrar_evento("PASSWORD INGRESADA")
+            return entrada
+
+        else:
+            entrada += tecla
+            print("Password:", "*" * len(entrada))
+            ventana1_mostrar_accesos(
+                "PROCESO",
+                f"{encabezado}: " + ("*" * len(entrada)),
+                usar_ultimo_rostro=True,
+            )
+
+            if len(entrada) > MAX_CARACTERES:
+                print("========================")
+                print(" MAXIMO 8 CARACTERES ")
+                print("========================")
+                registrar_evento("PASSWORD EXCEDIO MAXIMO")
+                ventana1_mostrar_accesos("DENEGADO", "Maximo 8 caracteres", usar_ultimo_rostro=True)
+                return None
+
+
+def cambiar_passwords_sistema():
+    config = cargar_configuracion()
+
+    actual = input("\nContraseña ADMIN actual: ").strip()
+    if actual != config.get("password_admin", DEFAULT_PASSWORD_ADMIN):
+        print("Contraseña ADMIN incorrecta.")
+        registrar_evento("INTENTO FALLIDO DE CAMBIO DE CONTRASEÑAS")
+        return
+
+    nueva_usuario = input("Nueva contraseña USUARIO (ENTER para conservar): ").strip()
+    nueva_admin = input("Nueva contraseña ADMIN (ENTER para conservar): ").strip()
+
+    if nueva_usuario:
+        if len(nueva_usuario) < MIN_CARACTERES:
+            print("La contraseña de usuario es demasiado corta.")
+            return
+        config["password_usuario"] = nueva_usuario
+
+    if nueva_admin:
+        if len(nueva_admin) < MIN_CARACTERES:
+            print("La contraseña de admin es demasiado corta.")
+            return
+        config["password_admin"] = nueva_admin
+
+    guardar_configuracion(config)
+    print("Contraseñas actualizadas correctamente.")
+    registrar_evento("CONTRASEÑAS DEL SISTEMA ACTUALIZADAS")
+
+
+# ============================================================
+# REGISTRO DE USUARIOS
+# ============================================================
+
+def registrar_usuario_completo(nombre=None, tipo_usuario=None):
+    usuarios = cargar_usuarios()
+
+    if nombre is None:
+        nombre = input("\nNombre del usuario: ").strip()
+    nombre = normalizar_nombre(nombre)
+
+    if not nombre:
+        print("Nombre inválido.")
+        return
+
+    if nombre in usuarios:
+        print("Ese usuario ya existe.")
+        return
+
+    if tipo_usuario is None:
+        print("\nTipo de cuenta")
+        print("1. Usuario")
+        print("2. Administrador")
+
+        tipo_opcion = input("Seleccione: ").strip()
+
+        if tipo_opcion == "2":
+            tipo_usuario = "admin"
+        else:
+            tipo_usuario = "usuario"
+
+    usuarios[nombre] = {
+        "tipo": tipo_usuario,
+        "activo": True,
+        "huella_id": None,
+        "rostro_id": None
+    }
+    guardar_usuarios(usuarios)
+
+    print(f"\nUsuario '{nombre}' registrado en la base de datos.")
+    registrar_evento(f"NUEVO USUARIO CREADO: {nombre} ({tipo_usuario})")
+
+    print("\nPaso 1/3: registro de huella")
+    huella_id = registrar_huella()
+    if huella_id is None:
+        print("No se pudo registrar la huella. El usuario quedó creado, pero sin huella.")
+        registrar_evento(f"USUARIO {nombre} SIN HUELLA")
+        return
+
+    usuarios = cargar_usuarios()
+    usuarios[nombre]["huella_id"] = huella_id
+    guardar_usuarios(usuarios)
+
+    print("\nPaso 2/3: captura de rostro")
+    capturados = capturar_rostros(nombre, TARGET_FACES)
+    if capturados <= 0:
+        print("No se capturaron rostros. El usuario quedó creado, pero sin rostro.")
+        registrar_evento(f"USUARIO {nombre} SIN ROSTRO")
+        return
+
+    print("\nPaso 3/3: entrenamiento LBPH")
+    if entrenar_lbph():
+        usuarios = cargar_usuarios()
+        guardar_usuarios(usuarios)
+        print("\nRegistro completo realizado correctamente.")
+        registrar_evento(f"REGISTRO COMPLETO REALIZADO PARA {nombre}")
+    else:
+        print("\nNo fue posible entrenar LBPH en este momento.")
+        registrar_evento(f"ERROR ENTRENANDO LBPH PARA {nombre}")
+
+
+def ver_usuarios():
+    usuarios = cargar_usuarios()
+    listar_usuarios(usuarios)
+
+
+def activar_desactivar_usuario():
+    usuarios = cargar_usuarios()
+    nombre = seleccionar_usuario(usuarios)
+    if not nombre:
+        print("Usuario no encontrado.")
+        return
+
+    actual = bool(usuarios[nombre].get("activo", True))
+    nuevo = not actual
+
+    texto = "ACTIVO" if nuevo else "INACTIVO"
+    confirmar = input(f"\nCambiar a {texto}? (s/n): ").strip().lower()
+    if confirmar != "s":
+        print("Operación cancelada.")
+        return
+
+    usuarios[nombre]["activo"] = nuevo
+    guardar_usuarios(usuarios)
+    print(f"Usuario '{nombre}' actualizado a {texto}.")
+    registrar_evento(f"USUARIO {nombre} CAMBIADO A {texto}")
+
+
+def eliminar_usuario():
+    usuarios = cargar_usuarios()
+    nombre = seleccionar_usuario(usuarios)
+    if not nombre:
+        print("Usuario no encontrado.")
+        return
+
+    confirmar = input(f"\n¿Eliminar '{nombre}' por completo? (s/n): ").strip().lower()
+    if confirmar != "s":
+        print("Operación cancelada.")
+        return
+
+    huella_id = usuarios[nombre].get("huella_id", None)
+
+    if huella_id is not None:
+        eliminar_huella_por_id(huella_id)
+
+    carpeta_rostros = os.path.join(ROSTROS_DIR, nombre)
+    if os.path.exists(carpeta_rostros):
+        shutil.rmtree(carpeta_rostros, ignore_errors=True)
+        print(f"Carpeta de rostros eliminada: {carpeta_rostros}")
+        registrar_evento(f"CARPETA DE ROSTROS ELIMINADA: {carpeta_rostros}")
+
+    usuarios.pop(nombre, None)
+    guardar_usuarios(usuarios)
+
+    print("Reentrenando LBPH para actualizar el modelo...")
+    if entrenar_lbph():
+        print(f"Usuario '{nombre}' eliminado correctamente.")
+        registrar_evento(f"USUARIO ELIMINADO: {nombre}")
+    else:
+        print(f"Usuario '{nombre}' eliminado, pero no se pudo reentrenar LBPH.")
+        registrar_evento(f"USUARIO ELIMINADO SIN REENTRENAR LBPH: {nombre}")
+
+
+def reentrenar_lbph():
+    ok = entrenar_lbph()
+    if ok:
+        print("Reentrenamiento completado.")
+    else:
+        print("No fue posible reentrenar el modelo.")
+
+
+def probar_menu_admin():
+    print("\n================================")
+    print(" MENÚ DE REGISTRO ")
+    print("================================")
+    print("1. Registrar usuario completo")
+    print("2. Ver usuarios")
+    print("3. Activar / Desactivar usuario")
+    print("4. Eliminar usuario")
+    print("5. Cambiar contraseñas del sistema")
+    print("6. Reentrenar LBPH")
+    print("7. Probar reconocimiento facial")
+    print("8. Crear respaldo")
+    print("9. Borrar datos temporales")
+    print("10. Ver conteo de entradas")
+
+
+def _panel_ventana2():
+    video_x = 22
+    video_w = VENTANA_ETAPA2_VIDEO_ANCHO
+    panel_x = video_x + video_w + 22
+    panel_y = 104
+    panel_w = VENTANA_ETAPA2_PANEL_ANCHO
+    panel_h = VENTANA_ETAPA2_ALTO - panel_y - 22
+    return panel_x, panel_y, panel_w, panel_h
+
+
+def _mostrar_panel_ventana2(
+    titulo,
+    lineas=None,
+    pie="Enter confirmar  Esc volver",
+    opcion_activa=None,
+    frame_base=None,
+):
+    global ventana2_menu_rects
+
+    frame = frame_base if frame_base is not None else _base_etapa2_para_display()
+    lienzo = _componer_ventana2(
+        frame,
+        encabezado="REGISTROS + ETAPA 2",
+        mensaje=pie,
+        opcion_activa=opcion_activa,
+    )
+
+    x, y, w, h = _panel_ventana2()
+    _rect(lienzo, x, y, w, h, (34, 24, 18), (112, 82, 58), 1)
+    _texto(lienzo, str(titulo)[:34], x + 18, y + 34, 0.58, (255, 150, 20), 2)
+
+    yy = y + 72
+    for linea in (lineas or []):
+        _texto(lienzo, str(linea)[:42], x + 20, yy, 0.46, (238, 242, 248), 1)
+        yy += 30
+
+    _rect(lienzo, x + 16, y + h - 48, w - 32, 34, (43, 31, 22), (112, 82, 58), 1)
+    _texto(lienzo, pie, x + 32, y + h - 25, 0.39, (225, 205, 185), 1)
+    ventana2_menu_rects = []
+    _mostrar_frame(VENTANA_ETAPA2, lienzo, VENTANA_ETAPA2_POS)
+
+
+def _esperar_tecla_ventana2():
+    tecla = cv2.waitKey(20) & 0xFF
+    if tecla in (255,):
+        return None
+    if tecla in (13, 10):
+        return "#"
+    if tecla in (27,):
+        return "*"
+    if tecla in (8, 127):
+        return "BORRAR"
+    try:
+        return chr(tecla)
+    except Exception:
+        return None
+
+
+def limpiar_caracter_ventana2(tecla):
+    if not tecla or len(tecla) != 1:
+        return None
+
+    tecla = texto_ascii(tecla)
+    if not tecla or len(tecla) != 1:
+        return None
+
+    permitidos = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _-.@"
+    if tecla not in permitidos:
+        return None
+
+    return tecla.upper()
+
+
+def ventana2_esperar_continuar(titulo, lineas=None):
+    while True:
+        _mostrar_panel_ventana2(titulo, lineas, pie="Enter continuar  Esc volver")
+        tecla = _esperar_tecla_ventana2()
+        if tecla in ("#", "*", "\r", "\n"):
+            return
+
+
+def ventana2_confirmar(titulo, lineas=None):
+    while True:
+        opciones = ["", "S / Enter  Si", "N / Esc  No"]
+        _mostrar_panel_ventana2(
+            titulo,
+            (lineas or []) + opciones,
+            pie="S/Enter si   N/Esc no",
+        )
+        tecla = _esperar_tecla_ventana2()
+        if tecla in ("A", "a", "#", "s", "S"):
+            return True
+        if tecla in ("B", "b", "*", "n", "N"):
+            return False
+
+
+def ventana2_pedir_texto(titulo, lineas=None, valor_inicial="", valor_si_vacio=None):
+    texto = str(valor_inicial or "")
+    redibujar = True
+    while True:
+        if redibujar:
+            visibles = list(lineas or [])
+            visibles += ["", f"> {texto or '_'}"]
+            _mostrar_panel_ventana2(
+                titulo,
+                visibles,
+                pie="Escribe, Enter confirma, Esc cancela",
+            )
+            redibujar = False
+
+        tecla = _esperar_tecla_ventana2()
+        if tecla is None:
+            continue
+        if tecla == "*":
+            return None
+        if tecla == "#":
+            return texto.strip() or valor_si_vacio
+        if tecla == "BORRAR":
+            texto = texto[:-1]
+            redibujar = True
+            continue
+        caracter = limpiar_caracter_ventana2(tecla)
+        if caracter is not None and len(texto) < 24:
+            texto += caracter
+            redibujar = True
+
+
+def siguiente_nombre_usuario():
+    usuarios = cargar_usuarios()
+    indice = 1
+    while True:
+        nombre = f"USUARIO_{indice:03d}"
+        if nombre not in usuarios:
+            return nombre
+        indice += 1
+
+
+def ventana2_seleccionar_lista(titulo, opciones, pie="W/S mover  Enter seleccionar  Esc cancelar"):
+    if not opciones:
+        ventana2_esperar_continuar(titulo, ["No hay elementos para seleccionar."])
+        return None
+
+    seleccionado = 0
+    while True:
+        inicio = max(0, min(seleccionado - 5, max(0, len(opciones) - 12)))
+        visibles = []
+        for idx in range(inicio, min(len(opciones), inicio + 12)):
+            marca = ">" if idx == seleccionado else " "
+            visibles.append(f"{marca} {idx + 1}. {opciones[idx]}")
+
+        _mostrar_panel_ventana2(titulo, visibles, pie=pie)
+        tecla = _esperar_tecla_ventana2()
+        if tecla in ("A", "a", "w", "W"):
+            seleccionado = (seleccionado - 1) % len(opciones)
+        elif tecla in ("B", "b", "s", "S"):
+            seleccionado = (seleccionado + 1) % len(opciones)
+        elif tecla == "#":
+            return seleccionado
+        elif tecla == "*":
+            return None
+        elif tecla and tecla.isdigit():
+            valor = int(tecla)
+            if valor == 0:
+                valor = 10
+            if 1 <= valor <= len(opciones):
+                return valor - 1
+
+
+def seleccionar_opcion_menu_registro():
+    global ventana2_click_opcion
+
+    opcion = 1
+    total_opciones = 10
+    ventana2_click_opcion = None
+    ultimo_dibujo = 0.0
+    while True:
+        ahora = time.time()
+        if ahora - ultimo_dibujo >= 0.08:
+            frame = _base_etapa2_para_display()
+            lienzo = _componer_ventana2(
+                frame,
+                encabezado="REGISTROS + ETAPA 2",
+                mensaje="Click, numeros o Enter",
+                opcion_activa=opcion,
+            )
+            _mostrar_frame(VENTANA_ETAPA2, lienzo, VENTANA_ETAPA2_POS)
+            ultimo_dibujo = ahora
+
+        tecla_matricial = leer_tecla()
+        if tecla_matricial == "#":
+            ventana2_click_opcion = None
+            return VENTANA2_SOLICITAR_ACCESO
+
+        if ventana2_click_opcion is not None:
+            opcion = ventana2_click_opcion
+            ventana2_click_opcion = None
+            return str(opcion)
+
+        tecla = _esperar_tecla_ventana2()
+        if tecla is None:
+            continue
+        if tecla in ("A", "a", "w", "W"):
+            opcion = total_opciones if opcion == 1 else opcion - 1
+            ultimo_dibujo = 0.0
+        elif tecla in ("B", "b", "s", "S"):
+            opcion = 1 if opcion == total_opciones else opcion + 1
+            ultimo_dibujo = 0.0
+        elif tecla in ("#", "\r", "\n"):
+            return str(opcion)
+        elif tecla == "*":
+            return None
+        elif tecla and tecla.isdigit():
+            return "10" if tecla == "0" else tecla
+
+
+def ver_usuarios_gui():
+    usuarios = cargar_usuarios()
+    if not usuarios:
+        ventana2_esperar_continuar("Usuarios", ["No hay usuarios registrados."])
+        return
+
+    lineas = []
+    for nombre in sorted(usuarios.keys())[:14]:
+        datos = usuarios[nombre]
+        estado = "ACTIVO" if datos.get("activo", True) else "INACTIVO"
+        tipo = datos.get("tipo", "usuario").upper()
+        lineas.append(f"{nombre} | {tipo} | {estado}")
+    ventana2_esperar_continuar("Usuarios registrados", lineas)
+
+
+def registrar_usuario_completo_gui():
+    nombre_auto = siguiente_nombre_usuario()
+    nombre = ventana2_pedir_texto(
+        "Registrar usuario",
+        ["Escribe el nombre.", f"Si dejas vacio usa: {nombre_auto}"],
+        valor_si_vacio=nombre_auto,
+    )
+    if not nombre:
+        return
+
+    tipo_idx = ventana2_seleccionar_lista("Tipo de cuenta", ["Usuario", "Administrador"])
+    if tipo_idx is None:
+        return
+    tipo_usuario = "admin" if tipo_idx == 1 else "usuario"
+
+    _mostrar_panel_ventana2(
+        "Registro iniciado",
+        [f"Usuario: {normalizar_nombre(nombre)}", "Sigue las instrucciones de huella y rostro."],
+        pie="Proceso en curso",
+    )
+    registrar_usuario_completo(nombre=nombre, tipo_usuario=tipo_usuario)
+    ventana2_esperar_continuar("Registro", ["Proceso de registro finalizado."])
+
+
+def seleccionar_usuario_gui(titulo="Seleccione usuario"):
+    usuarios = cargar_usuarios()
+    nombres = sorted(usuarios.keys())
+    idx = ventana2_seleccionar_lista(titulo, nombres)
+    if idx is None:
+        return None
+    return nombres[idx]
+
+
+def activar_desactivar_usuario_gui():
+    usuarios = cargar_usuarios()
+    nombre = seleccionar_usuario_gui("Activar / Desactivar")
+    if not nombre:
+        return
+
+    actual = bool(usuarios[nombre].get("activo", True))
+    nuevo = not actual
+    texto = "ACTIVO" if nuevo else "INACTIVO"
+    if not ventana2_confirmar("Confirmar cambio", [f"{nombre}", f"Cambiar a {texto}?"]):
+        return
+
+    usuarios[nombre]["activo"] = nuevo
+    guardar_usuarios(usuarios)
+    registrar_evento(f"USUARIO {nombre} CAMBIADO A {texto}")
+    ventana2_esperar_continuar("Usuario actualizado", [f"{nombre}", f"Estado: {texto}"])
+
+
+def eliminar_usuario_gui():
+    usuarios = cargar_usuarios()
+    nombre = seleccionar_usuario_gui("Eliminar usuario")
+    if not nombre:
+        return
+
+    if not ventana2_confirmar("Confirmar eliminacion", [f"Eliminar {nombre}?", "Esta accion no se puede deshacer."]):
+        return
+
+    huella_id = usuarios[nombre].get("huella_id", None)
+    if huella_id is not None:
+        eliminar_huella_por_id(huella_id)
+
+    carpeta_rostros = os.path.join(ROSTROS_DIR, nombre)
+    if os.path.exists(carpeta_rostros):
+        shutil.rmtree(carpeta_rostros, ignore_errors=True)
+        registrar_evento(f"CARPETA DE ROSTROS ELIMINADA: {carpeta_rostros}")
+
+    usuarios.pop(nombre, None)
+    guardar_usuarios(usuarios)
+    entrenar_lbph()
+    registrar_evento(f"USUARIO ELIMINADO: {nombre}")
+    ventana2_esperar_continuar("Usuario eliminado", [nombre])
+
+
+def cambiar_passwords_sistema_gui():
+    config = cargar_configuracion()
+    actual = ventana2_pedir_texto("Password admin", ["Ingresa password admin actual."])
+    if actual != config.get("password_admin", DEFAULT_PASSWORD_ADMIN):
+        ventana2_esperar_continuar("Password incorrecto", ["No se hicieron cambios."])
+        registrar_evento("INTENTO FALLIDO DE CAMBIO DE CONTRASEÑAS")
+        return
+
+    tipo_idx = ventana2_seleccionar_lista(
+        "Cambiar password",
+        ["Usuario", "Administrador"],
+        pie="Selecciona cual cambiar",
+    )
+    if tipo_idx is None:
+        return
+
+    es_admin = tipo_idx == 1
+    clave_config = "password_admin" if es_admin else "password_usuario"
+    etiqueta = "admin" if es_admin else "usuario"
+
+    nueva_password = ventana2_pedir_texto(
+        f"Password {etiqueta}",
+        [f"Nueva password {etiqueta}.", "Deja vacio para cancelar."],
+        valor_si_vacio="",
+    )
+    if nueva_password is None:
+        return
+
+    if not nueva_password:
+        ventana2_esperar_continuar("Cambio cancelado", ["No se hicieron cambios."])
+        return
+
+    if len(nueva_password) < MIN_CARACTERES:
+        ventana2_esperar_continuar(
+            "Password corta",
+            [f"La password de {etiqueta} es muy corta."],
+        )
+        return
+
+    config[clave_config] = nueva_password
+
+    guardar_configuracion(config)
+    registrar_evento(f"PASSWORD DE {etiqueta.upper()} ACTUALIZADA")
+    ventana2_esperar_continuar(
+        "Password actualizada",
+        [f"Password de {etiqueta} guardada correctamente."],
+    )
+
+
+def mostrar_conteo_accesos_gui():
+    conteo = cargar_conteo_accesos()
+    fecha = datetime.now().strftime("%Y-%m-%d")
+    ultimo = conteo.get("ultimo_acceso") or {}
+    lineas = [
+        f"Total general: {conteo.get('total', 0)}",
+        f"Total hoy: {conteo.get('por_fecha', {}).get(fecha, 0)}",
+        f"Ultimo: {ultimo.get('usuario', 'Sin registro')}",
+        f"Hora: {ultimo.get('fecha_hora', '-')}",
+    ]
+    ventana2_esperar_continuar("Conteo de entradas", lineas)
+
+
+def reentrenar_lbph_gui():
+    _mostrar_panel_ventana2("Reentrenando LBPH", ["Espere un momento..."], pie="Proceso en curso")
+    ok = entrenar_lbph()
+    mensaje = "Reentrenamiento completado." if ok else "No fue posible reentrenar."
+    ventana2_esperar_continuar("Reentrenar LBPH", [mensaje])
+
+
+def crear_respaldo_gui():
+    _mostrar_panel_ventana2("Creando respaldo", ["Espere un momento..."], pie="Proceso en curso")
+    crear_respaldo()
+    ventana2_esperar_continuar("Respaldo", ["Respaldo creado correctamente."])
+
+
+def reiniciar_datos_temporales():
+    global etapa2_entraron
+    global etapa2_salieron
+    global etapa2_entradas_no_autorizadas
+    global etapa2_salidas_sin_registro
+    global etapa2_personas_dentro
+    global etapa2_permisos_pendientes
+    global etapa2_permiso_expira_en
+    global etapa2_permiso_visible_hasta
+    global etapa2_permiso_visible_usuario
+    global etapa2_permisos_consumibles_memoria
+    global etapa2_permisos_otorgados_hoy_memoria
+    global etapa2_permisos_otorgados_fecha_memoria
+    global etapa2_primer_sensor
+    global etapa2_tiempo_primer_sensor
+    global etapa2_ultimo_evento
+    global etapa2_rostro_nombre
+    global etapa2_rostro_estado
+    global etapa2_rostro_confianza
+
+    with etapa2_lock:
+        etapa2_entraron = 0
+        etapa2_salieron = 0
+        etapa2_entradas_no_autorizadas = 0
+        etapa2_salidas_sin_registro = 0
+        etapa2_personas_dentro = 0
+        etapa2_permisos_pendientes = 0
+        etapa2_permiso_expira_en = 0
+        etapa2_permiso_visible_hasta = 0
+        etapa2_permiso_visible_usuario = None
+        etapa2_permisos_consumibles_memoria = 0
+        etapa2_permisos_otorgados_hoy_memoria = 0
+        etapa2_permisos_otorgados_fecha_memoria = datetime.now().strftime("%Y-%m-%d")
+        etapa2_primer_sensor = None
+        etapa2_tiempo_primer_sensor = 0
+        etapa2_ultimo_evento = "Datos temporales borrados"
+        etapa2_rostro_nombre = None
+        etapa2_rostro_estado = None
+        etapa2_rostro_confianza = None
+        etapa2_alertas_rostro.clear()
+
+    permisos_limpios = {
+        "pendientes": [],
+        "historial": [],
+        "ultimo_permiso": None,
+        "permiso_visual": None,
+        "autorizaciones": {},
+        "por_fecha": {},
+    }
+    guardar_permisos_etapa1(permisos_limpios)
+
+    conteo_limpio = {
+        "total": 0,
+        "por_fecha": {},
+        "por_usuario": {},
+        "por_metodo": {},
+        "historial": [],
+        "ultimo_acceso": None,
+    }
+    guardar_json(CONTEO_ACCESOS_FILE, conteo_limpio)
+    permisos_resumen_cache["ts"] = 0
+    registrar_evento("DATOS TEMPORALES BORRADOS DESDE VENTANA 2")
+
+
+def reiniciar_datos_temporales_gui():
+    if not ventana2_confirmar(
+        "Borrar datos temporales",
+        [
+            "Borra conteos y permisos de prueba.",
+            "No borra usuarios, rostros ni modelo.",
+        ],
+    ):
+        return
+
+    reiniciar_datos_temporales()
+    ventana2_mostrar_registros_etapa2("Datos temporales borrados")
+    ventana2_esperar_continuar(
+        "Datos temporales",
+        ["Conteos, permisos y accesos temporales borrados."],
+    )
+
+
+def menu_registro(opcion_inicial=None):
+    ventana2_registro_activo.set()
+
+    while True:
+        limpiar()
+        probar_menu_admin()
+        if opcion_inicial is not None:
+            opcion = str(opcion_inicial)
+            opcion_inicial = None
+        else:
+            opcion = seleccionar_opcion_menu_registro()
+
+        if opcion == VENTANA2_SOLICITAR_ACCESO:
+            ventana2_mostrar_registros_etapa2("Acceso solicitado en Ventana 1")
+            ventana2_registro_activo.clear()
+            return VENTANA2_SOLICITAR_ACCESO
+
+        if opcion is None:
+            ventana2_mostrar_registros_etapa2("Etapa 2 en vigilancia")
+            ventana2_registro_activo.clear()
+            return None
+
+        if opcion == "1":
+            ventana2_mostrar_registros_etapa2("Registrar usuario")
+            registrar_usuario_completo_gui()
+
+        elif opcion == "2":
+            ventana2_mostrar_registros_etapa2("Ver usuarios")
+            ver_usuarios_gui()
+
+        elif opcion == "3":
+            ventana2_mostrar_registros_etapa2("Activar/desactivar")
+            activar_desactivar_usuario_gui()
+
+        elif opcion == "4":
+            ventana2_mostrar_registros_etapa2("Eliminar usuario")
+            eliminar_usuario_gui()
+
+        elif opcion == "5":
+            ventana2_mostrar_registros_etapa2("Cambiar passwords")
+            cambiar_passwords_sistema_gui()
+
+        elif opcion == "6":
+            ventana2_mostrar_registros_etapa2("Reentrenar LBPH")
+            reentrenar_lbph_gui()
+
+        elif opcion == "7":
+            ventana2_mostrar_registros_etapa2("Probar rostro")
+            probar_reconocimiento_facial()
+            ventana2_esperar_continuar("Prueba facial", ["Prueba finalizada."])
+
+        elif opcion == "8":
+            ventana2_mostrar_registros_etapa2("Crear respaldo")
+            crear_respaldo_gui()
+
+        elif opcion == "9":
+            ventana2_mostrar_registros_etapa2("Borrar datos temporales")
+            reiniciar_datos_temporales_gui()
+
+        elif opcion == "10":
+            ventana2_mostrar_registros_etapa2("Conteo de entradas")
+            mostrar_conteo_accesos_gui()
+
+        else:
+            print("\nOpción inválida.")
+            ventana2_esperar_continuar("Opcion invalida", ["Selecciona una opcion del menu."])
+            continue
+
+        ventana2_registro_activo.clear()
+        return None
+
+
+# ============================================================
+# ACCESO
+# ============================================================
+
+def acceso_autorizado(conteo=None):
+    print()
+    print("================================")
+    print(" ACCESO PERMITIDO ")
+    print(" PUERTA ABIERTA ")
+    if conteo is not None:
+        print(f" ENTRADAS HOY: {conteo.get('total_hoy', 0)} ")
+        print(f" ENTRADAS TOTAL: {conteo.get('total', 0)} ")
+    print("================================")
+    print()
+    ventana1_mostrar_accesos("AUTORIZADO", "Puerta abierta", conteo=conteo, usar_ultimo_rostro=True)
+    etapa3_abrir_puerta("ETAPA 1 ACCESO AUTORIZADO")
+
+
+def acceso_denegado(motivo):
+    print()
+    print("================================")
+    print(" ACCESO DENEGADO ")
+    print(f" MOTIVO: {motivo} ")
+    print("================================")
+    print()
+    ventana1_mostrar_accesos("DENEGADO", motivo, usar_ultimo_rostro=True)
+    if ETAPA3_ALARMA_EN_DENEGADO:
+        etapa3_activar_alarma(f"ETAPA 1 ACCESO DENEGADO: {motivo}")
+
+
+def seleccionar_modo():
+
+    print("\n======================")
+    print(" SELECCIONAR MODO ")
+    print("======================")
+    print("# = ACCESO")
+    print("REGISTROS: usar Ventana 2")
+
+    while True:
+
+        tecla = leer_tecla()
+
+        if tecla is None:
+            time.sleep(0.05)
+            continue
+
+        print("TECLA:", tecla)
+
+        if tecla == "#":
+            return "acceso"
+
+
+def flujo_acceso():
+    """
+    Flujo:
+        huella -> rostro -> password
+    """
+    ventana1_limpiar_rostro()
+    ventana1_mostrar_accesos("PROCESO", "Validando acceso")
+    usuarios = cargar_usuarios()
+    if not usuarios:
+        print("No hay usuarios registrados.")
+        registrar_evento("INTENTO DE ACCESO SIN USUARIOS")
+        ventana1_mostrar_accesos("DENEGADO", "No hay usuarios registrados")
+        return False
+
+    config = cargar_configuracion()
+    password_usuario = config.get("password_usuario", DEFAULT_PASSWORD_USUARIO)
+    password_admin = config.get("password_admin", DEFAULT_PASSWORD_ADMIN)
+
+    if not os.path.exists(MODELO_FILE):
+        print("No existe el modelo LBPH. Primero debes registrar y entrenar.")
+        registrar_evento("INTENTO DE ACCESO SIN MODELO LBPH")
+        ventana1_mostrar_accesos("DENEGADO", "Modelo facial no existe")
+        return False
+
+    mapa_rostros = cargar_mapa_rostros()
+
+    try:
+        modelo = cargar_modelo_lbph()
+    except Exception as e:
+        print(f"No se pudo cargar el modelo: {e}")
+        registrar_evento(f"ERROR CARGANDO MODELO EN ACCESO: {e}")
+        ventana1_mostrar_accesos("DENEGADO", "Error cargando modelo")
+        return False
+
+    clasificador = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    picam2 = None
+    intentos = 0
+    sistema_bloqueado = False
+
+    try:
+        while True:
+            if sistema_bloqueado:
+                print("========================")
+                print(" SISTEMA BLOQUEADO ")
+                print("========================")
+                print("VERIFICANDO ADMIN...")
+                ventana1_mostrar_accesos("PROCESO", "Sistema bloqueado: admin")
+
+                info_huella = verificar_huella()
+                if info_huella is None:
+                    acceso_denegado("HUELLA ADMIN")
+                    guardar_evidencia(picam2, "ADMIN_HUELLA")
+                    continue
+
+                nombre_h, datos_h = obtener_usuario_por_huella_id(usuarios, info_huella)
+                if nombre_h is None or datos_h is None:
+                    acceso_denegado("ADMIN NO REGISTRADO")
+                    guardar_evidencia(picam2, "ADMIN_NO_REGISTRADO")
+                    continue
+
+                if not datos_h.get("activo", True):
+                    acceso_denegado("ADMIN INACTIVO")
+                    guardar_evidencia(picam2, "ADMIN_INACTIVO")
+                    continue
+
+                if datos_h.get("tipo", "usuario") != "admin":
+                    acceso_denegado("USUARIO NO ES ADMIN")
+                    guardar_evidencia(picam2, "NO_ADMIN")
+                    continue
+
+                ventana1_mostrar_accesos("PROCESO", "Mira a la camara")
+                info_rostro = verificar_rostro_con_camara(clasificador, modelo, mapa_rostros)
+                if info_rostro is None:
+                    acceso_denegado("ROSTRO ADMIN")
+                    continue
+
+                nombre_r, datos_r = obtener_usuario_por_rostro_id(usuarios, info_rostro["id"], mapa_rostros)
+                if nombre_r is None or datos_r is None:
+                    acceso_denegado("ROSTRO ADMIN NO REGISTRADO")
+                    guardar_evidencia(picam2, "ADMIN_ROSTRO")
+                    continue
+
+                if normalizar_nombre(nombre_h) != normalizar_nombre(nombre_r):
+                    acceso_denegado("ADMIN NO COINCIDE")
+                    guardar_evidencia(picam2, "ADMIN_NO_COINCIDE")
+                    continue
+
+                print("========================")
+                print(" INGRESA PASSWORD ADMIN ")
+                print("========================")
+                ventana1_mostrar_accesos("PROCESO", f"{normalizar_nombre(nombre_h)[:10]} ADMIN")
+                password_ingresada = pedir_password("admin", nombre_h)
+
+                if password_ingresada == password_admin:
+                    registrar_evento(f"DESBLOQUEO ADMIN CORRECTO: {nombre_h}")
+                    print("========================")
+                    print(" SISTEMA DESBLOQUEADO ")
+                    print("========================")
+                    sistema_bloqueado = False
+                    intentos = 0
+                else:
+                    registrar_evento("ADMIN INCORRECTO")
+                    acceso_denegado("ADMIN")
+                    guardar_evidencia(picam2, "ADMIN_PASSWORD")
+                continue
+
+            print("\n================================")
+            print(" ACCESO BIOMÉTRICO ")
+            print("================================")
+            ventana1_mostrar_accesos("PROCESO", "Coloca huella")
+
+            id_huella = verificar_huella()
+            if id_huella is None:
+                acceso_denegado("HUELLA")
+                guardar_evidencia(picam2, "HUELLA")
+                continue
+
+            nombre_huella, datos_huella = obtener_usuario_por_huella_id(usuarios, id_huella)
+
+            if nombre_huella is None or datos_huella is None:
+                registrar_evento(f"HUELLA SIN USUARIO ASIGNADO ID={id_huella}")
+                acceso_denegado("HUELLA NO ASIGNADA")
+                guardar_evidencia(picam2, "HUELLA_SIN_USUARIO")
+                continue
+
+            if not datos_huella.get("activo", True):
+                registrar_evento(f"USUARIO INACTIVO EN HUELLA: {nombre_huella}")
+                acceso_denegado("USUARIO INACTIVO")
+                guardar_evidencia(picam2, "USUARIO_INACTIVO")
+                continue
+
+            ventana1_mostrar_accesos("PROCESO", "Mira a la camara")
+            info_rostro = verificar_rostro_con_camara(clasificador, modelo, mapa_rostros)
+            if info_rostro is None:
+                acceso_denegado("ROSTRO")
+                guardar_evidencia(picam2, "ROSTRO")
+                continue
+
+            nombre_rostro, datos_rostro = obtener_usuario_por_rostro_id(
+                usuarios,
+                info_rostro["id"],
+                mapa_rostros
+            )
+
+            if nombre_rostro is None or datos_rostro is None:
+                registrar_evento(f"ROSTRO SIN USUARIO ASIGNADO ID={info_rostro['id']}")
+                acceso_denegado("ROSTRO NO ASIGNADO")
+                guardar_evidencia(picam2, "ROSTRO_SIN_USUARIO")
+                continue
+
+            if not datos_rostro.get("activo", True):
+                registrar_evento(f"USUARIO INACTIVO EN ROSTRO: {nombre_rostro}")
+                acceso_denegado("USUARIO INACTIVO")
+                guardar_evidencia(picam2, "USUARIO_INACTIVO_ROSTRO")
+                continue
+
+            if normalizar_nombre(nombre_huella) != normalizar_nombre(nombre_rostro):
+                registrar_evento(
+                    f"NO COINCIDEN HUELLA Y ROSTRO: {nombre_huella} != {nombre_rostro}"
+                )
+                acceso_denegado("NO COINCIDEN")
+                guardar_evidencia(picam2, "NO_COINCIDEN")
+                continue
+
+            tipo_cuenta = str(datos_huella.get("tipo", "usuario")).strip().lower()
+            es_admin = tipo_cuenta == "admin"
+            etiqueta_password = "admin" if es_admin else "usuario"
+            password_esperada = password_admin if es_admin else password_usuario
+
+            print("========================")
+            print(f" INGRESA PASSWORD {etiqueta_password.upper()} ")
+            print(f" USUARIO: {normalizar_nombre(nombre_huella)} ({etiqueta_password.upper()})")
+            print("========================")
+            ventana1_mostrar_accesos(
+                "PROCESO",
+                f"{normalizar_nombre(nombre_huella)[:10]} {etiqueta_password.upper()}",
+                usar_ultimo_rostro=True,
+            )
+
+            while True:
+                password = pedir_password(etiqueta_password, nombre_huella)
+
+                if password is None:
+                    intentos += 1
+                    registrar_evento(
+                        f"PASSWORD INVALIDA INTENTO {intentos}/{MAX_INTENTOS_PASSWORD}"
+                    )
+                    acceso_denegado("PASSWORD")
+                    guardar_evidencia(picam2, "PASSWORD")
+
+                    if intentos >= MAX_INTENTOS_PASSWORD:
+                        sistema_bloqueado = True
+                        registrar_evento("SISTEMA BLOQUEADO POR EXCESO DE INTENTOS")
+                    break
+
+                if password == password_esperada:
+                    registrar_evento(
+                        f"ACCESO {etiqueta_password.upper()} CORRECTO: {nombre_huella} | "
+                        f"HUELLA {id_huella} | ROSTRO {info_rostro['id']}"
+                    )
+                    conteo = registrar_entrada(nombre_huella)
+                    acceso_autorizado(conteo)
+                    intentos = 0
+                    return True
+
+                else:
+                    intentos += 1
+                    registrar_evento(
+                        f"PASSWORD INCORRECTA INTENTO {intentos}/{MAX_INTENTOS_PASSWORD}"
+                    )
+                    acceso_denegado("PASSWORD")
+                    guardar_evidencia(picam2, "PASSWORD")
+
+                    if intentos >= MAX_INTENTOS_PASSWORD:
+                        sistema_bloqueado = True
+                        registrar_evento("SISTEMA BLOQUEADO POR EXCESO DE INTENTOS")
+                    break
+
+    finally:
+        cerrar_camara(picam2)
+
+
+# ============================================================
+# ETAPA 2 - CONTROL DE AFORO EN SEGUNDO PLANO
+# ============================================================
+
+ETAPA2_GPIO_SENSOR_AFUERA = 23
+ETAPA2_GPIO_SENSOR_ADENTRO = 24
+ETAPA2_PIR_GPIO = 25
+ETAPA2_CAMARA_SENSOR = 0
+
+ETAPA2_AREA_MINIMA = 3000
+ETAPA2_TIEMPO_ENTRE_FOTOS = 3
+ETAPA2_TIEMPO_ENTRE_ALERTAS = 10
+ETAPA2_TIEMPO_MAXIMO_SECUENCIA = 2.0
+ETAPA2_INTERVALO_RECONOCIMIENTO_ROSTRO = float(
+    os.environ.get("ETAPA2_INTERVALO_RECONOCIMIENTO_ROSTRO", "2.0")
+)
+ETAPA2_INTERVALO_ALERTA_ROSTRO = float(
+    os.environ.get("ETAPA2_INTERVALO_ALERTA_ROSTRO", "60.0")
+)
+ETAPA2_CARPETA_EVIDENCIAS = os.path.join(EVIDENCIAS_DIR, "detecciones_cuarto")
+# La camara de Etapa 2 vigila siempre. La ventana se dibuja desde el menu
+# principal para evitar bloqueos de OpenCV con hilos distintos.
+ETAPA2_MOSTRAR_VENTANA = os.environ.get("ETAPA2_MOSTRAR_VENTANA", "1") == "1"
+ETAPA2_CAMARA_VIGILANCIA_SIEMPRE = (
+    os.environ.get("ETAPA2_CAMARA_VIGILANCIA_SIEMPRE", "1") == "1"
+)
+
+etapa2_lock = Lock()
+etapa2_detener_evento = Event()
+etapa2_hilo = None
+
+etapa2_entraron = 0
+etapa2_salieron = 0
+etapa2_entradas_no_autorizadas = 0
+etapa2_salidas_sin_registro = 0
+etapa2_personas_dentro = 0
+etapa2_permisos_pendientes = 0
+etapa2_permiso_expira_en = 0
+etapa2_permiso_visible_hasta = 0
+etapa2_permiso_visible_usuario = None
+etapa2_permisos_consumibles_memoria = 0
+etapa2_permisos_otorgados_hoy_memoria = 0
+etapa2_permisos_otorgados_fecha_memoria = datetime.now().strftime("%Y-%m-%d")
+etapa2_primer_sensor = None
+etapa2_tiempo_primer_sensor = 0
+etapa2_ultimo_guardado = 0
+etapa2_ultima_alerta_area_vacia = 0
+etapa2_ultimo_evento = "Etapa 2 iniciando"
+etapa2_frame_vista = None
+etapa2_ventana_visible = False
+etapa2_movimiento_camara_activo = False
+etapa2_pir_activo_visual = False
+etapa2_modelo_rostros = None
+etapa2_mapa_rostros = {}
+etapa2_clasificador_rostros = None
+etapa2_reconocimiento_disponible = None
+etapa2_ultimo_reconocimiento = 0
+etapa2_rostro_nombre = None
+etapa2_rostro_estado = None
+etapa2_rostro_confianza = None
+etapa2_alertas_rostro = {}
+
+
+def etapa2_actualizar_permiso_visible(
+    vence_epoch=None,
+    usuario=None,
+    cantidad=1,
+    sumar_hoy=False,
+):
+    global etapa2_permiso_visible_hasta
+    global etapa2_permiso_visible_usuario
+    global etapa2_permisos_consumibles_memoria
+    global etapa2_permisos_otorgados_hoy_memoria
+    global etapa2_permisos_otorgados_fecha_memoria
+
+    try:
+        vence = float(vence_epoch or 0)
+    except Exception:
+        vence = 0
+
+    if vence <= time.time():
+        vence = time.time() + TIEMPO_PERMISO_ETAPA1
+
+    with etapa2_lock:
+        etapa2_permiso_visible_hasta = max(etapa2_permiso_visible_hasta, vence)
+        if usuario:
+            etapa2_permiso_visible_usuario = usuario
+        if sumar_hoy:
+            etapa2_permisos_consumibles_memoria += max(1, int(cantidad or 1))
+        if sumar_hoy:
+            fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+            if etapa2_permisos_otorgados_fecha_memoria != fecha_hoy:
+                etapa2_permisos_otorgados_fecha_memoria = fecha_hoy
+                etapa2_permisos_otorgados_hoy_memoria = 0
+            etapa2_permisos_otorgados_hoy_memoria += max(1, int(cantidad or 1))
+
+
+def etapa2_permiso_visible_activo():
+    with etapa2_lock:
+        vence = float(etapa2_permiso_visible_hasta or 0)
+    return vence >= time.time()
+
+
+def etapa2_sincronizar_permisos_etapa1():
+    global etapa2_permisos_pendientes
+    global etapa2_permiso_expira_en
+
+    permisos = limpiar_permisos_vencidos(cargar_permisos_etapa1())
+    guardar_permisos_etapa1(permisos)
+    pendientes = permisos.get("pendientes", [])
+
+    with etapa2_lock:
+        etapa2_permisos_pendientes = len(pendientes)
+        if pendientes:
+            etapa2_permiso_expira_en = max(float(p.get("vence_epoch", 0)) for p in pendientes)
+        else:
+            etapa2_permiso_expira_en = 0
+
+
+def etapa2_permiso_activo():
+    resumen = obtener_resumen_permisos_etapa1(cache_segundos=0.2)
+    activo = (
+        resumen["activos"] > 0
+        or resumen["ultimo_vigente"]
+        or etapa2_permiso_visible_activo()
+    )
+    etapa2_sincronizar_permisos_etapa1()
+    return activo
+
+
+def etapa2_consumir_permiso():
+    global etapa2_permisos_consumibles_memoria
+
+    permiso = consumir_permiso_etapa1()
+    etapa2_sincronizar_permisos_etapa1()
+    if permiso is not None:
+        with etapa2_lock:
+            if etapa2_permisos_consumibles_memoria > 0:
+                etapa2_permisos_consumibles_memoria -= 1
+        return True
+
+    with etapa2_lock:
+        if (
+            etapa2_permisos_consumibles_memoria > 0
+            and float(etapa2_permiso_visible_hasta or 0) >= time.time()
+        ):
+            etapa2_permisos_consumibles_memoria -= 1
+            return True
+
+    # El permiso visible puede durar horas para mostrarse en pantalla, pero no
+    # autoriza entradas infinitas. Solo un permiso pendiente o consumible autoriza.
+    return False
+
+
+def etapa2_registrar_permiso_manual(cantidad=1):
+    global etapa2_ultimo_evento
+
+    registrar_permiso_etapa1(
+        cantidad=cantidad,
+        metodo="prueba_etapa2",
+        usuario="simulacion",
+        contar_acceso=True
+    )
+    etapa2_sincronizar_permisos_etapa1()
+
+    with etapa2_lock:
+        etapa2_ultimo_evento = f"Permiso manual Etapa 2: {cantidad}"
+
+    print(f"PERMISO MANUAL ETAPA 2: {cantidad} acceso(s)")
+
+
+def etapa2_obtener_estado():
+    etapa2_sincronizar_permisos_etapa1()
+    resumen_permisos = obtener_resumen_permisos_etapa1(cache_segundos=0.2)
+    ahora = time.time()
+
+    with etapa2_lock:
+        visible_hasta = float(etapa2_permiso_visible_hasta or 0)
+        consumibles_memoria = int(etapa2_permisos_consumibles_memoria or 0)
+        fecha_memoria = etapa2_permisos_otorgados_fecha_memoria
+        otorgados_hoy_memoria = etapa2_permisos_otorgados_hoy_memoria
+        movimiento_camara = etapa2_movimiento_camara_activo
+        pir_activo_visual = etapa2_pir_activo_visual
+        rostro_nombre = etapa2_rostro_nombre
+        rostro_estado = etapa2_rostro_estado
+        rostro_confianza = etapa2_rostro_confianza
+
+    visible_activo = visible_hasta >= ahora
+    visible_vence_en = max(0, int(round(visible_hasta - ahora))) if visible_activo else 0
+    permisos_vigentes = int(resumen_permisos["vigentes"] or 0)
+    permiso_vigente = permisos_vigentes > 0
+    permiso_vence_en = (
+        max(int(resumen_permisos["vence_en"] or 0), visible_vence_en)
+        if permiso_vigente
+        else 0
+    )
+    fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+    if fecha_memoria != fecha_hoy:
+        otorgados_hoy_memoria = 0
+    permisos_otorgados_hoy = max(
+        int(resumen_permisos["otorgados_hoy"] or 0),
+        int(otorgados_hoy_memoria or 0),
+    )
+
+    with etapa2_lock:
+        return {
+            "entraron": etapa2_entraron,
+            "salieron": etapa2_salieron,
+            "entradas_no_autorizadas": etapa2_entradas_no_autorizadas,
+            "salidas_sin_registro": etapa2_salidas_sin_registro,
+            "personas_dentro": etapa2_personas_dentro,
+            "permisos_pendientes": max(
+                int(resumen_permisos["pendientes"] or 0),
+                consumibles_memoria if visible_activo else 0,
+            ),
+            "permisos_vigentes": permisos_vigentes,
+            "permisos_otorgados_hoy": permisos_otorgados_hoy,
+            "permiso_activo": permiso_vigente,
+            "permiso_vigente": permiso_vigente,
+            "permiso_vence_en": permiso_vence_en,
+            "pir_activo": pir_activo_visual,
+            "movimiento_camara": movimiento_camara,
+            "rostro_nombre": rostro_nombre,
+            "rostro_estado": rostro_estado,
+            "rostro_confianza": rostro_confianza,
+            "ultimo_evento": etapa2_ultimo_evento,
+        }
+
+
+def etapa2_mostrar_conteo():
+    datos = etapa2_obtener_estado()
+    print("===================================")
+    print(" ETAPA 2 - AFORO ")
+    print("===================================")
+    print(f"Entraron: {datos['entraron']}")
+    print(f"Salieron: {datos['salieron']}")
+    print(f"Personas dentro: {datos['personas_dentro']}")
+    print(f"Entradas no autorizadas: {datos['entradas_no_autorizadas']}")
+    print(f"Salidas sin registro previo: {datos['salidas_sin_registro']}")
+    print(f"Permisos pendientes Etapa 1: {datos['permisos_pendientes']}")
+    print("===================================")
+
+
+def etapa2_registrar_entrada_sensor():
+    global etapa2_entraron
+    global etapa2_personas_dentro
+    global etapa2_entradas_no_autorizadas
+    global etapa2_ultimo_evento
+
+    permiso_valido = etapa2_consumir_permiso()
+
+    with etapa2_lock:
+        etapa2_entraron += 1
+        etapa2_personas_dentro += 1
+
+        if permiso_valido:
+            etapa2_ultimo_evento = "Persona entro con permiso"
+            print("ETAPA 2: persona ENTRO con permiso")
+        else:
+            etapa2_entradas_no_autorizadas += 1
+            etapa2_ultimo_evento = "ALERTA: entrada sin permiso"
+            print("ETAPA 2 ALERTA: persona ENTRO sin permiso de Etapa 1")
+            etapa3_activar_alarma("ETAPA 2 ENTRADA SIN PERMISO")
+
+    etapa2_mostrar_conteo()
+
+
+def etapa2_registrar_salida_sensor():
+    global etapa2_salieron
+    global etapa2_personas_dentro
+    global etapa2_salidas_sin_registro
+    global etapa2_ultimo_evento
+
+    salida_valida = False
+    usuario_salida = None
+
+    with etapa2_lock:
+        etapa2_salieron += 1
+
+        if etapa2_personas_dentro > 0:
+            etapa2_personas_dentro -= 1
+            etapa2_ultimo_evento = "Persona salio"
+            salida_valida = True
+            if str(etapa2_rostro_estado or "").upper() == "AUTORIZADO":
+                usuario_salida = etapa2_rostro_nombre
+            print("ETAPA 2: persona SALIO")
+        else:
+            etapa2_salidas_sin_registro += 1
+            etapa2_ultimo_evento = "Salida detectada con conteo en cero"
+            print("ETAPA 2 AVISO: salida detectada, pero el conteo ya estaba en cero")
+            etapa3_activar_alarma("ETAPA 2 SALIDA CON CONTEO EN CERO")
+
+    if salida_valida:
+        usuario_descontado = descontar_autorizacion_por_salida(usuario_salida)
+        if usuario_descontado:
+            with etapa2_lock:
+                etapa2_ultimo_evento = f"Persona salio: {usuario_descontado}"
+
+    etapa2_mostrar_conteo()
+
+
+def etapa2_registrar_sensor(sensor):
+    global etapa2_primer_sensor
+    global etapa2_tiempo_primer_sensor
+
+    ahora = time.time()
+
+    with etapa2_lock:
+        if (
+            etapa2_primer_sensor is not None
+            and ahora - etapa2_tiempo_primer_sensor > ETAPA2_TIEMPO_MAXIMO_SECUENCIA
+        ):
+            etapa2_primer_sensor = None
+
+        if etapa2_primer_sensor is None:
+            etapa2_primer_sensor = sensor
+            etapa2_tiempo_primer_sensor = ahora
+            return
+
+        if etapa2_primer_sensor == sensor:
+            return
+
+        secuencia = (etapa2_primer_sensor, sensor)
+        etapa2_primer_sensor = None
+
+    if secuencia == ("AFUERA", "ADENTRO"):
+        etapa2_registrar_entrada_sensor()
+    elif secuencia == ("ADENTRO", "AFUERA"):
+        etapa2_registrar_salida_sensor()
+
+
+def etapa2_guardar_evidencia(frame_rgb, origen):
+    global etapa2_ultimo_guardado
+
+    ahora = time.time()
+    if ahora - etapa2_ultimo_guardado <= ETAPA2_TIEMPO_ENTRE_FOTOS:
+        return
+
+    os.makedirs(ETAPA2_CARPETA_EVIDENCIAS, exist_ok=True)
+    fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archivo = os.path.join(
+        ETAPA2_CARPETA_EVIDENCIAS,
+        f"{origen}_camera_{ETAPA2_CAMARA_SENSOR}_{fecha}.jpg"
+    )
+
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(archivo, frame_bgr)
+
+    print(f"ETAPA 2 evidencia guardada: {archivo}")
+    etapa2_ultimo_guardado = ahora
+
+
+def etapa2_registrar_alerta_vigilancia(frame_rgb, origenes, cuarto_vacio=False):
+    global etapa2_ultima_alerta_area_vacia
+    global etapa2_ultimo_evento
+
+    ahora = time.time()
+    if ahora - etapa2_ultima_alerta_area_vacia <= ETAPA2_TIEMPO_ENTRE_ALERTAS:
+        return
+
+    origen_texto = " y ".join(origenes)
+    origen_archivo = "_".join(origenes)
+    estado = "cuarto vacio" if cuarto_vacio else "vigilancia permanente"
+    mensaje = f"ALERTA ETAPA 2: movimiento detectado en {estado} ({origen_texto})"
+
+    with etapa2_lock:
+        etapa2_ultimo_evento = mensaje
+
+    print(mensaje)
+    registrar_evento(mensaje)
+    etapa3_activar_alarma(mensaje)
+    if frame_rgb is not None:
+        etapa2_guardar_evidencia(frame_rgb, origen_archivo)
+    etapa2_ultima_alerta_area_vacia = ahora
+
+
+def etapa2_detectar_movimiento_camara(frame_rgb, frame_anterior):
+    gris = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+    gris = cv2.GaussianBlur(gris, (21, 21), 0)
+
+    movimiento = False
+
+    if frame_anterior is None:
+        return movimiento, gris
+
+    diferencia = cv2.absdiff(frame_anterior, gris)
+    umbral = cv2.threshold(diferencia, 25, 255, cv2.THRESH_BINARY)[1]
+    umbral = cv2.dilate(umbral, None, iterations=2)
+
+    contornos, _ = cv2.findContours(
+        umbral,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    for contorno in contornos:
+        if cv2.contourArea(contorno) < ETAPA2_AREA_MINIMA:
+            continue
+
+        movimiento = True
+        x, y, w, h = cv2.boundingRect(contorno)
+        cv2.rectangle(frame_rgb, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    return movimiento, gris
+
+
+def etapa2_dibujar_estado(frame_rgb, movimiento_camara, pir_activo):
+    global etapa2_movimiento_camara_activo
+    global etapa2_pir_activo_visual
+
+    with etapa2_lock:
+        etapa2_movimiento_camara_activo = bool(movimiento_camara)
+        etapa2_pir_activo_visual = bool(pir_activo)
+
+
+def etapa2_preparar_reconocimiento_facial():
+    global etapa2_modelo_rostros
+    global etapa2_mapa_rostros
+    global etapa2_clasificador_rostros
+    global etapa2_reconocimiento_disponible
+
+    if etapa2_reconocimiento_disponible is not None:
+        return etapa2_reconocimiento_disponible
+
+    try:
+        etapa2_modelo_rostros = cargar_modelo_lbph()
+        etapa2_mapa_rostros = cargar_mapa_rostros()
+        etapa2_clasificador_rostros = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        etapa2_reconocimiento_disponible = not etapa2_clasificador_rostros.empty()
+    except Exception as e:
+        etapa2_reconocimiento_disponible = False
+        registrar_evento_silencioso(f"ETAPA 2 SIN RECONOCIMIENTO FACIAL: {e}")
+
+    return etapa2_reconocimiento_disponible
+
+
+def etapa2_marcar_rostro_no_autorizado(nombre, confianza, frame_rgb):
+    global etapa2_entradas_no_autorizadas
+    global etapa2_ultimo_evento
+
+    ahora = time.time()
+    nombre = normalizar_nombre(nombre)
+    ultimo = float(etapa2_alertas_rostro.get(nombre, 0) or 0)
+    if ahora - ultimo < ETAPA2_INTERVALO_ALERTA_ROSTRO:
+        return
+
+    etapa2_alertas_rostro[nombre] = ahora
+    with etapa2_lock:
+        etapa2_entradas_no_autorizadas += 1
+        etapa2_ultimo_evento = f"ALERTA: {nombre} sin autorizacion vigente"
+
+    registrar_evento(
+        f"ETAPA 2 ROSTRO NO AUTORIZADO: {nombre} confianza={confianza:.0f}"
+    )
+    etapa3_activar_alarma(f"ETAPA 2 ROSTRO NO AUTORIZADO: {nombre}")
+    etapa2_guardar_evidencia(frame_rgb, f"rostro_no_autorizado_{nombre}")
+
+
+def etapa2_reconocer_rostro_vigilancia(frame_rgb):
+    global etapa2_ultimo_reconocimiento
+    global etapa2_rostro_nombre
+    global etapa2_rostro_estado
+    global etapa2_rostro_confianza
+
+    ahora = time.time()
+    if ahora - etapa2_ultimo_reconocimiento < ETAPA2_INTERVALO_RECONOCIMIENTO_ROSTRO:
+        return
+    etapa2_ultimo_reconocimiento = ahora
+
+    if not etapa2_preparar_reconocimiento_facial():
+        return
+
+    try:
+        gris = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        caras = etapa2_clasificador_rostros.detectMultiScale(
+            gris,
+            scaleFactor=1.2,
+            minNeighbors=5,
+            minSize=(80, 80),
+        )
+    except Exception:
+        return
+
+    if len(caras) == 0:
+        with etapa2_lock:
+            etapa2_rostro_nombre = None
+            etapa2_rostro_estado = None
+            etapa2_rostro_confianza = None
+        return
+
+    x, y, w, h = obtener_rostro_mayor(caras)
+    rostro = gris[y:y + h, x:x + w]
+    try:
+        rostro = cv2.resize(rostro, FACE_SIZE)
+        id_usuario, confianza = etapa2_modelo_rostros.predict(rostro)
+    except Exception:
+        return
+
+    nombre = etapa2_mapa_rostros.get(str(id_usuario), "DESCONOCIDO")
+    reconocido = confianza < FACE_THRESHOLD and nombre != "DESCONOCIDO"
+    autorizado = reconocido and usuario_tiene_autorizacion_vigente(nombre)
+
+    if reconocido:
+        estado = "AUTORIZADO" if autorizado else "NO AUTORIZADO"
+        color = (0, 255, 0) if autorizado else (255, 0, 0)
+        if not autorizado:
+            etapa2_marcar_rostro_no_autorizado(nombre, confianza, frame_rgb)
+    else:
+        nombre = "DESCONOCIDO"
+        estado = "NO AUTORIZADO"
+        color = (255, 0, 0)
+
+    cv2.rectangle(frame_rgb, (x, y), (x + w, y + h), color, 2)
+    with etapa2_lock:
+        etapa2_rostro_nombre = normalizar_nombre(nombre)
+        etapa2_rostro_estado = estado
+        etapa2_rostro_confianza = confianza
+
+
+def etapa2_abrir_camara():
+    return Picamera2(camera_num=ETAPA2_CAMARA_SENSOR)
+
+
+def etapa2_ejecutar():
+    global etapa2_frame_vista
+
+    sensor_afuera = None
+    sensor_adentro = None
+    pir = None
+    camara = None
+
+    try:
+        asegurar_archivos_etapa1()
+        os.makedirs(ETAPA2_CARPETA_EVIDENCIAS, exist_ok=True)
+
+        sensor_afuera = DigitalInputDevice(
+            ETAPA2_GPIO_SENSOR_AFUERA,
+            pull_up=True,
+            bounce_time=0.1,
+        )
+        sensor_adentro = DigitalInputDevice(
+            ETAPA2_GPIO_SENSOR_ADENTRO,
+            pull_up=True,
+            bounce_time=0.1,
+        )
+        pir = MotionSensor(ETAPA2_PIR_GPIO)
+
+        sensor_afuera.when_activated = lambda: etapa2_registrar_sensor("AFUERA")
+        sensor_adentro.when_activated = lambda: etapa2_registrar_sensor("ADENTRO")
+
+        camara = etapa2_abrir_camara()
+        camara.configure(
+            camara.create_video_configuration(
+                main={"size": CAMERA_SIZE, "format": "RGB888"},
+            )
+        )
+        camara.start()
+        time.sleep(2)
+
+        frame_anterior = None
+
+        registrar_evento_silencioso("ETAPA 2 INICIADA EN SEGUNDO PLANO")
+
+        while not etapa2_detener_evento.is_set():
+            frame = camara.capture_array()
+            movimiento_camara, frame_anterior = etapa2_detectar_movimiento_camara(
+                frame,
+                frame_anterior,
+            )
+            if not ventana2_registro_activo.is_set():
+                etapa2_reconocer_rostro_vigilancia(frame)
+
+            datos = etapa2_obtener_estado()
+            sin_personas_dentro = int(datos.get("personas_dentro", 0) or 0) == 0
+            sin_acceso_pendiente = int(datos.get("permisos_pendientes", 0) or 0) == 0
+            vigilancia_armada = sin_personas_dentro and sin_acceso_pendiente
+
+            origenes_alerta = []
+            if vigilancia_armada and pir.motion_detected:
+                origenes_alerta.append("pir")
+
+            if movimiento_camara and vigilancia_armada:
+                origenes_alerta.append("camara")
+
+            if origenes_alerta:
+                etapa2_registrar_alerta_vigilancia(
+                    frame,
+                    origenes_alerta,
+                    cuarto_vacio=vigilancia_armada
+                )
+
+            if ETAPA2_MOSTRAR_VENTANA:
+                frame_vista = frame.copy()
+                etapa2_dibujar_estado(frame_vista, movimiento_camara, vigilancia_armada)
+                with etapa2_lock:
+                    etapa2_frame_vista = cv2.cvtColor(frame_vista, cv2.COLOR_RGB2BGR)
+
+            time.sleep(0.03)
+
+    except Exception as e:
+        registrar_evento(f"ERROR ETAPA 2: {e}")
+        print(f"ERROR ETAPA 2: {e}")
+    finally:
+        if camara is not None:
+            try:
+                camara.stop()
+                camara.close()
+            except Exception:
+                pass
+
+        for sensor in (sensor_afuera, sensor_adentro, pir):
+            if sensor is None:
+                continue
+            try:
+                sensor.close()
+            except Exception:
+                pass
+
+        registrar_evento_silencioso("ETAPA 2 DETENIDA")
+
+
+def iniciar_etapa2_en_segundo_plano():
+    global etapa2_hilo
+
+    if etapa2_hilo is not None and etapa2_hilo.is_alive():
+        return etapa2_hilo
+
+    etapa2_detener_evento.clear()
+    etapa2_hilo = Thread(target=etapa2_ejecutar, name="Etapa2Aforo", daemon=True)
+    etapa2_hilo.start()
+    return etapa2_hilo
+
+
+def detener_etapa2():
+    etapa2_detener_evento.set()
+    if etapa2_hilo is not None and etapa2_hilo.is_alive():
+        etapa2_hilo.join(timeout=5)
+
+
+def etapa2_mostrar_ventana_en_menu():
+    global etapa2_ventana_visible
+    global ventana2_click_opcion
+
+    if (
+        not ETAPA2_MOSTRAR_VENTANA
+        or etapa1_ventana_activa.is_set()
+        or ventana2_registro_activo.is_set()
+    ):
+        return
+
+    frame = _base_etapa2_para_display()
+    frame = _componer_ventana2(frame, mensaje="Menu por click/touch")
+
+    if not etapa2_ventana_visible:
+        try:
+            _configurar_ventana(
+                VENTANA_ETAPA2,
+                frame.shape[1],
+                frame.shape[0],
+                VENTANA_ETAPA2_POS,
+                VENTANA2_FULLSCREEN,
+            )
+            etapa2_ventana_visible = True
+        except Exception as e:
+            registrar_evento(f"ERROR CREANDO VENTANA ETAPA 2: {e}")
+            return
+
+    if not VENTANA2_FULLSCREEN:
+        cv2.resizeWindow(VENTANA_ETAPA2, frame.shape[1], frame.shape[0])
+    cv2.imshow(VENTANA_ETAPA2, frame)
+    tecla = cv2.waitKey(1) & 0xFF
+
+    if tecla in (ord("p"), ord("P")):
+        etapa2_registrar_permiso_manual()
+    elif tecla in tuple(ord(str(n)) for n in range(10)):
+        numero = chr(tecla)
+        ventana2_click_opcion = 10 if numero == "0" else int(numero)
+
+
+def etapa2_cerrar_ventana():
+    global etapa2_ventana_visible
+
+    if not etapa2_ventana_visible:
+        return
+
+    try:
+        cv2.destroyWindow(VENTANA_ETAPA2)
+        cv2.waitKey(1)
+    except Exception:
+        pass
+
+    etapa2_ventana_visible = False
+
+
+# ============================================================
+# MENÚ PRINCIPAL
+# ============================================================
+
+def menu_principal():
+    print("\n================================")
+    print(" SISTEMA BIOMÉTRICO UNIFICADO ")
+    print("================================")
+    print("# = ACCESO EN VENTANA 1")
+    print("VENTANA 2 = REGISTROS Y VIGILANCIA INDEPENDIENTE")
+    print("Ctrl+C = SALIR")
+    ventana1_mostrar_accesos("LISTO", "Presiona # para iniciar")
+    ventana2_mostrar_registros_etapa2("Menu principal")
+
+
+def flujo_principal():
+    global ventana2_click_opcion
+
+    while True:
+
+        menu_principal()
+        ultimo_refresco_ventana1 = 0
+        opcion_registro_directa = None
+
+        print("\nEsperando # para acceso. Ventana 2 se controla aparte...")
+
+        while True:
+
+            etapa2_mostrar_ventana_en_menu()
+
+            tecla = leer_tecla()
+
+            if tecla is not None:
+                print("TECLA:", tecla)
+
+                if tecla == "#":
+                    ventana2_click_opcion = None
+                    ventana1_mostrar_accesos("PROCESO", "Iniciando acceso")
+                    modo = "acceso"
+                    break
+
+            if ventana2_click_opcion is not None:
+                opcion_registro_directa = str(ventana2_click_opcion)
+                ventana2_click_opcion = None
+                ventana2_mostrar_registros_etapa2("Opcion seleccionada")
+                modo = "registro"
+                break
+
+            if time.time() - ultimo_refresco_ventana1 >= VENTANA1_INTERVALO_REFRESCO:
+                ventana1_mostrar_accesos("LISTO", "Presiona # para iniciar")
+                ultimo_refresco_ventana1 = time.time()
+
+            time.sleep(0.05)
+
+        if modo == "registro":
+            resultado = menu_registro(opcion_registro_directa)
+            if resultado == VENTANA2_SOLICITAR_ACCESO:
+                flujo_acceso()
+
+        elif modo == "acceso":
+            flujo_acceso()
+
+
+def main():
+    asegurar_estructura()
+    print(f"VERSION SISTEMA: {VERSION_SISTEMA}")
+    registrar_evento("SISTEMA INICIADO")
+    etapa3_iniciar_relevadores()
+    iniciar_vista_camara_etapa1()
+    iniciar_etapa2_en_segundo_plano()
+
+    try:
+        flujo_principal()
+    except KeyboardInterrupt:
+        registrar_evento("SISTEMA FINALIZADO POR EL USUARIO")
+    finally:
+        detener_vista_camara_etapa1()
+        detener_etapa2()
+        etapa3_apagar_relevadores()
+
+        try:
+            led_apagado()
+        except Exception:
+            pass
+
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+        try:
+            lgpio.gpiochip_close(h_gpio)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
